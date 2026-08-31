@@ -2,7 +2,7 @@
   "id": "aliyunpan",
   "name": "阿里云盘同步",
   "description": "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额。",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "sdkVersion": "0.1",
   "apiVersion": 1,
   "author": "dibin",
@@ -11,19 +11,19 @@
   "documentationUrl": "https://github.com/dibin666/tdrive-aliyunpan/blob/main/README.md",
   "artifacts": {
     "linux/amd64": {
-      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-linux-amd64",
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.0.0/tdrive-aliyunpan-linux-amd64",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "linux/arm64": {
-      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-linux-arm64",
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.0.0/tdrive-aliyunpan-linux-arm64",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "windows/amd64": {
-      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-windows-amd64.exe",
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.0.0/tdrive-aliyunpan-windows-amd64.exe",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "windows/arm64": {
-      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-windows-arm64.exe",
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.0.0/tdrive-aliyunpan-windows-arm64.exe",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   },

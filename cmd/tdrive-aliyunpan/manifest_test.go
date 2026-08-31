@@ -28,11 +28,18 @@ var publishedPlatforms = [][2]string{
 // the running process reports Manifest() over RPC. The manager compares the
 // two as marshalled JSON and refuses to start the plugin if they differ, so
 // this check mirrors that comparison exactly.
+//
+// The version is the one field left out. It is not written in either place: the
+// release workflow stamps it into the binary with -ldflags and writes the same
+// number into the manifest it publishes, so a working copy has the placeholder
+// on both sides and a release has the tag on both sides.
+// TestPluginServesOverRPC is what checks they land on the same value.
 func TestManifestMatchesFile(t *testing.T) {
-	installed := installedManifestJSON(t, readDeclaredManifest(t))
-	compiled := installedManifestJSON(t, (&plugin{}).Manifest())
-	if installed != compiled {
-		t.Errorf("tdrive.plugin.json and Manifest() disagree:\nfile:   %s\nbinary: %s", installed, compiled)
+	declared, compiled := readDeclaredManifest(t), (&plugin{}).Manifest()
+	declared.Version, compiled.Version = "", ""
+	if installedManifestJSON(t, declared) != installedManifestJSON(t, compiled) {
+		t.Errorf("tdrive.plugin.json and Manifest() disagree:\nfile:   %s\nbinary: %s",
+			installedManifestJSON(t, declared), installedManifestJSON(t, compiled))
 	}
 }
 

@@ -21,6 +21,16 @@ import (
 
 const pluginID = "aliyunpan"
 
+// version is the SemVer this build reports, injected with -ldflags.
+//
+// The release workflow tags every commit on main and passes the resulting
+// number both to the compiler and into the tdrive.plugin.json it publishes, so
+// the binary and the manifest installed beside it can never disagree — which
+// matters because the host compares the two and refuses to start the plugin if
+// they differ. The default is what a working copy reports, and the committed
+// manifest carries the same placeholder so the two still match locally.
+var version = "0.0.0"
+
 type plugin struct {
 	logger *log.Logger
 	engine *syncengine.Engine
@@ -33,7 +43,7 @@ func (p *plugin) Manifest() tdriveplugin.Manifest {
 		ID:               pluginID,
 		Name:             "阿里云盘同步",
 		Description:      "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额。",
-		Version:          "0.1.0",
+		Version:          version,
 		SDKVersion:       "0.1",
 		APIVersion:       tdriveplugin.APIVersion,
 		Author:           "dibin",

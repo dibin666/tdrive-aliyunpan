@@ -105,7 +105,9 @@ func TestPluginServesOverRPC(t *testing.T) {
 		t.Fatalf("manifest: %v", err)
 	}
 	// The host refuses to start a plugin whose reported manifest differs from
-	// the installed JSON, comparing the two as marshalled JSON.
+	// the installed JSON, comparing the two as marshalled JSON. The version is
+	// included here — this is the only place that proves the number linked
+	// into the binary is the number the published manifest declares.
 	compiled := installedManifestJSON(t, manifest)
 	installed := installedManifestJSON(t, readDeclaredManifest(t))
 	if compiled != installed {
@@ -163,8 +165,26 @@ func TestPluginServesOverRPC(t *testing.T) {
 
 func buildPlugin(t *testing.T) string {
 	t.Helper()
+	// The release workflow points this at the artifact it is about to publish,
+	// so the handshake runs against those exact bytes instead of a rebuild of
+	// them. Rebuilding would hide the one mistake that matters most here: a
+	// build that lost its version stamp still produces a binary this test
+	// would happily recreate correctly.
+	if prebuilt := os.Getenv("TDRIVE_PLUGIN_TEST_BINARY"); prebuilt != "" {
+		return prebuilt
+	}
+
 	binary := filepath.Join(t.TempDir(), "tdrive-aliyunpan")
-	build := exec.Command("go", "build", "-o", binary, ".")
+	// Built the way the release workflow builds it: stamped with the version
+	// the manifest beside it declares, so the comparison holds for any version
+	// rather than only for the placeholder in a working copy.
+	//
+	// The symbol is main.version rather than the full import path because this
+	// links a real main package; a -ldflags passed to `go test` would have to
+	// name the package path instead, which is why the workflow does not use one.
+	declared := readDeclaredManifest(t)
+	build := exec.Command("go", "build",
+		"-ldflags", "-X main.version="+declared.Version, "-o", binary, ".")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build plugin: %v: %s", err, output)

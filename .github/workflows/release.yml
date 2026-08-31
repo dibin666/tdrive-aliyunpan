@@ -3,10 +3,12 @@ name: release
 # tdrive does not compile plugins. It downloads a release binary, checks it
 # against the SHA-256 in the published manifest, and only then executes it —
 # so building the artifacts and pinning their digests is this repository's job.
+#
+# Versioning follows the main program: every commit on main becomes a release,
+# with the patch number incremented from the newest existing tag.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -32,88 +34,117 @@ jobs:
           # follows the go directive rather than a version pinned here.
           go-version-file: go.mod
 
+      # Everything that can fail without burning a version number runs before
+      # the tag is created.
       - name: Vet and test
         run: |
           set -euo pipefail
           go vet ./...
-          # The Windows build is cross-compiled and never executed here, so vet
-          # is the only thing standing between a GOOS-specific mistake and a
-          # published artifact that cannot start.
+          # The Windows binaries are cross-compiled and never executed here, so
+          # vet is the only thing standing between a GOOS-specific mistake and
+          # a published artifact that cannot start.
           GOOS=windows go vet ./...
           go test ./...
 
-      - name: Resolve release version
+      - name: Create release version
         id: version
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          version="$(jq -r .version tdrive.plugin.json)"
-          tag="v$version"
+          git fetch --tags --force
 
-          # The manifest is the source of truth: the version it declares also
-          # names the release the artifact URLs point at.
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
-            echo "tag $GITHUB_REF_NAME does not match manifest version $version" >&2
-            exit 1
-          fi
-
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Release $tag already exists. Bump version in tdrive.plugin.json" \
-              "and cmd/tdrive-aliyunpan/main.go to publish a new one." >> "$GITHUB_STEP_SUMMARY"
+          current="$(git tag --points-at "$GITHUB_SHA" --sort=-v:refname \
+            | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+          if [ -n "$current" ]; then
+            tag="$current"
+            version="${current#v}"
           else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+            latest="$(git tag --list 'v*' --sort=-v:refname \
+              | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+            if [ -z "$latest" ]; then
+              version="0.1.0"
+            else
+              value="${latest#v}"
+              IFS=. read -r major minor patch <<< "$value"
+              version="$major.$minor.$((patch + 1))"
+            fi
+
+            tag="v$version"
+            while git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; do
+              IFS=. read -r major minor patch <<< "$version"
+              version="$major.$minor.$((patch + 1))"
+              tag="v$version"
+            done
+
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git tag -a "$tag" "$GITHUB_SHA" -m "Release $version"
+            git push origin "$tag"
           fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Build the binaries and pin them in the published manifest
         id: manifest
-        if: steps.version.outputs.publish == 'true'
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp tdrive.plugin.json dist/tdrive.plugin.json
 
-          # tdrive publishes Linux and Windows builds, and the plugin follows it
-          # onto both. On Windows the .exe suffix is load-bearing: os/exec will
-          # not start an extension-less absolute path, so tdrive stores the
-          # installed binary as <id>.exe and the asset is named to match.
-          for platform in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+          # The committed manifest is a placeholder; the published one is
+          # generated here so its version, its artifact URLs and the binaries
+          # beside them all come from the tag this run just created. It is
+          # rewritten in place because the next step's tests read it from the
+          # working tree.
+          jq --arg v "$VERSION" '.version = $v' tdrive.plugin.json > "$RUNNER_TEMP/manifest.tmp"
+          mv "$RUNNER_TEMP/manifest.tmp" tdrive.plugin.json
+
+          # The artifact keys are the platform list: adding a platform is one
+          # edit in tdrive.plugin.json and this loop follows it.
+          for platform in $(jq -r '.artifacts | keys[]' tdrive.plugin.json); do
             goos="${platform%/*}"
             goarch="${platform#*/}"
             asset="tdrive-aliyunpan-$goos-$goarch"
+            # tdrive renames whatever it downloads, so this suffix is only for
+            # a human who fetches the asset directly — but on Windows that is
+            # the difference between a runnable file and one Explorer will not
+            # open.
             if [ "$goos" = windows ]; then
               asset="$asset.exe"
             fi
 
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-              go build -trimpath -buildvcs=false \
+              go build -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION" \
               -o "dist/$asset" ./cmd/tdrive-aliyunpan
 
-            expected="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$asset"
-            declared="$(jq -r --arg p "$platform" '.artifacts[$p].url // ""' dist/tdrive.plugin.json)"
-            if [ "$declared" != "$expected" ]; then
-              echo "artifacts[\"$platform\"].url is \"$declared\", expected \"$expected\"" >&2
-              exit 1
-            fi
-
-            # The committed manifest carries placeholder digests: a binary
-            # cannot contain its own hash, so the real values can only be
+            # A binary cannot contain its own hash, so the digest can only be
             # computed once the binary exists.
             digest="$(sha256sum "dist/$asset" | cut -d' ' -f1)"
             jq --arg p "$platform" --arg d "$digest" \
-              '.artifacts[$p].sha256 = $d' dist/tdrive.plugin.json > dist/manifest.tmp
-            mv dist/manifest.tmp dist/tdrive.plugin.json
+              --arg u "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$asset" \
+              '.artifacts[$p].url = $u | .artifacts[$p].sha256 = $d' \
+              tdrive.plugin.json > "$RUNNER_TEMP/manifest.tmp"
+            mv "$RUNNER_TEMP/manifest.tmp" tdrive.plugin.json
           done
 
+          cp tdrive.plugin.json dist/tdrive.plugin.json
           echo "digest=$(sha256sum dist/tdrive.plugin.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      - name: Check the artifact against the published manifest
+        run: |
+          set -euo pipefail
+          # tdrive refuses to start a plugin whose reported manifest differs
+          # from the installed JSON, and an install that fails that late has
+          # already burned a version number. So the linux/amd64 artifact is
+          # driven through a real go-plugin handshake here and its manifest
+          # compared against the rewritten file — the same pair, and the same
+          # comparison, the host will make after an install.
+          TDRIVE_PLUGIN_TEST_BINARY="$PWD/dist/tdrive-aliyunpan-linux-amd64" \
+            go test -count=1 ./cmd/tdrive-aliyunpan/
+
       - name: Publish GitHub release
-        if: steps.version.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -131,6 +162,12 @@ jobs:
             echo "$manifest_url"
             echo '```'
             echo
+            echo "总是装最新版就用这个地址（它跟着 latest 走，不是固定版本）："
+            echo
+            echo '```'
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/tdrive.plugin.json"
+            echo '```'
+            echo
             echo "清单 SHA-256（插件商店索引里的 \`manifestDigest\`）：\`$MANIFEST_DIGEST\`"
             echo
             echo "| 平台 | 二进制 SHA-256 |"
@@ -140,13 +177,6 @@ jobs:
             jq -r '.artifacts | to_entries | sort_by(.key)[]
               | "| \(.key) | `\(.value.sha256)` |"' dist/tdrive.plugin.json
           } > "$notes"
-
-          if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git tag -a "$TAG" "$GITHUB_SHA" -m "Release $VERSION"
-            git push origin "$TAG"
-          fi
 
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
