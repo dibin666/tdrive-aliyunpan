@@ -44,8 +44,18 @@ var missingSegmentsPattern = regexp.MustCompile(`missing segments \[([0-9 ]*)\]`
 func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.RuntimeSettings) bool {
 	defer e.releaseReservation(item.Size)
 
+	// Cancel interrupts this context. Every error branch below has to check for
+	// that first: a cancelled transfer fails with a context error like any other
+	// and would otherwise be read as a transient blip and queued straight back
+	// up, which is the opposite of what was asked for.
+	ctx, release := e.watchItem(ctx, item.ID)
+	defer release()
+
 	staged, err := e.stage(ctx, item, limits)
 	if err != nil {
+		if e.stoppedByCancel(item.ID) {
+			return true
+		}
 		if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
 			e.invalidateProbe()
 			e.requestProbeRefresh()
@@ -68,11 +78,20 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 	defer func() { cleanupStaged(staged, item.ID) }()
 
 	if err := e.upload(ctx, item, staged, limits); err != nil {
+		if e.stoppedByCancel(item.ID) {
+			return true
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			e.deferUntilRetry(ctx, item, err)
 			return false
 		}
 		e.fail(ctx, item, err)
+		return true
+	}
+	if e.stoppedByCancel(item.ID) {
+		// The upload finished in the gap between the cancellation and this
+		// check. Deleting the cloud original and reporting success would both
+		// contradict a decision the operator has already made.
 		return true
 	}
 	if item.DeleteAfter {
@@ -228,10 +247,19 @@ func (e *Engine) upload(ctx context.Context, item *Item, staged string, limits h
 		pending = append(pending, index)
 	}
 
+	// A transfer stopped on purpose is recorded as cancelled rather than failed,
+	// on this page and in tdrive's history alike.
+	abortState := func() string {
+		if e.stoppedByCancel(item.ID) {
+			return "cancelled"
+		}
+		return "failed"
+	}
+
 	var lastErr error
 	for round := 0; round < resendRounds; round++ {
 		if err := e.sendSegments(ctx, item, file, job, pending); err != nil {
-			e.abort(ctx, item, job.ID, err.Error())
+			e.abort(ctx, item, job.ID, err.Error(), abortState())
 			return err
 		}
 		missing, err := e.commit(ctx, job.ID)
@@ -240,13 +268,13 @@ func (e *Engine) upload(ctx context.Context, item *Item, staged string, limits h
 		}
 		lastErr = err
 		if len(missing) == 0 {
-			e.abort(ctx, item, job.ID, err.Error())
+			e.abort(ctx, item, job.ID, err.Error(), abortState())
 			return err
 		}
 		e.logger.Printf("%s 缺少分片 %v，重发第 %d 轮", item.Name, missing, round+1)
 		pending = missing
 	}
-	e.abort(ctx, item, job.ID, "重发分片后仍未完成")
+	e.abort(ctx, item, job.ID, "重发分片后仍未完成", abortState())
 	return fmt.Errorf("上传未能完成: %w", lastErr)
 }
 
@@ -374,12 +402,18 @@ func parseMissingSegments(err error) []int {
 	return indices
 }
 
-// abort tears down a failed upload so the storage channel is not left holding
-// documents nothing points at.
-func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason string) {
+// abort tears down an upload that will not complete, so the storage channel is
+// not left holding documents nothing points at.
+//
+// state is what tdrive records: "failed" for a transfer that broke, "cancelled"
+// for one somebody stopped. Recording every abort as a failure made a
+// cancellation from this page show up in tdrive's history as an error.
+func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason, state string) {
+	// The cleanup context outlives the cancellation that usually causes it,
+	// which is the whole reason a cancelled upload can still be tidied up.
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
-	if err := e.host.AbortUpload(cleanupCtx, jobID, reason, "failed"); err != nil {
+	if err := e.host.AbortUpload(cleanupCtx, jobID, reason, state); err != nil {
 		e.logger.Printf("放弃上传 %s 失败: %v", item.Name, err)
 	}
 	e.mu.Lock()

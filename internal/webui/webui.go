@@ -131,19 +131,38 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		if request.Method != http.MethodPost {
 			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
 		}
-		if err := s.engine.Retry(ctx, query.Get("id")); err != nil {
+		ids, err := queueIDs(request.Body, query.Get("id"))
+		if err != nil {
 			return status(http.StatusBadRequest, err.Error()), nil
 		}
-		return okJSON(map[string]bool{"ok": true})
+		if err := s.engine.Retry(ctx, ids...); err != nil {
+			return status(http.StatusBadRequest, err.Error()), nil
+		}
+		return okJSON(map[string]any{"ok": true, "count": len(ids)})
 
 	case "/api/queue/cancel":
 		if request.Method != http.MethodPost {
 			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
 		}
-		if err := s.engine.Cancel(ctx, query.Get("id")); err != nil {
+		ids, err := queueIDs(request.Body, query.Get("id"))
+		if err != nil {
 			return status(http.StatusBadRequest, err.Error()), nil
 		}
-		return okJSON(map[string]bool{"ok": true})
+		if err := s.engine.Cancel(ctx, ids...); err != nil {
+			return status(http.StatusBadRequest, err.Error()), nil
+		}
+		return okJSON(map[string]any{"ok": true, "count": len(ids)})
+
+	case "/api/queue/delete":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
+		ids, err := queueIDs(request.Body, query.Get("id"))
+		if err != nil {
+			return status(http.StatusBadRequest, err.Error()), nil
+		}
+		s.engine.ClearFinished(ctx, ids...)
+		return okJSON(map[string]any{"ok": true, "count": len(ids)})
 
 	case "/api/queue/clear":
 		if request.Method != http.MethodPost {
@@ -260,6 +279,46 @@ func (s *Server) requireAdmin(ctx context.Context, userID string) error {
 		return nil
 	}
 	return fmt.Errorf("找不到当前账号")
+}
+
+// maxQueueIDs bounds one batch. The queue view can select a whole screenful at
+// a time, but a request naming tens of thousands of ids is a mistake rather
+// than an intention.
+const maxQueueIDs = 2000
+
+// queueIDs reads the items a queue action applies to, from either a JSON body
+// of ids or the single-id query parameter the per-row buttons still use.
+func queueIDs(body []byte, single string) ([]string, error) {
+	if len(body) > 0 {
+		var request struct {
+			IDs []string `json:"ids"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return nil, fmt.Errorf("请求不是合法的 JSON: %w", err)
+		}
+		ids := make([]string, 0, len(request.IDs))
+		seen := make(map[string]bool, len(request.IDs))
+		for _, id := range request.IDs {
+			id = strings.TrimSpace(id)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("没有选中任何队列项")
+		}
+		if len(ids) > maxQueueIDs {
+			return nil, fmt.Errorf("一次最多操作 %d 项", maxQueueIDs)
+		}
+		return ids, nil
+	}
+	single = strings.TrimSpace(single)
+	if single == "" {
+		return nil, fmt.Errorf("没有选中任何队列项")
+	}
+	return []string{single}, nil
 }
 
 func browsePath(path string) string {

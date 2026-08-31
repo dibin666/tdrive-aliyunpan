@@ -72,6 +72,15 @@ type Engine struct {
 	quotaDirty    bool
 	persistMu     sync.Mutex
 
+	// cancels holds the context of every transfer currently moving bytes, so a
+	// cancellation from the queue view can interrupt one instead of waiting for
+	// it. cancelling remembers which of those stopped on purpose: the error a
+	// cancelled transfer reports is a context error like any other, and without
+	// this the deferred-retry path would read it as a blip and queue the file
+	// straight back up. Both are guarded by mu.
+	cancels    map[string]context.CancelFunc
+	cancelling map[string]bool
+
 	wake chan struct{}
 	// running counts in-flight transfers so Close can wait for them.
 	workers sync.WaitGroup
@@ -93,13 +102,15 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Engine{
-		host:     host,
-		dataDir:  dataDir,
-		logger:   logger,
-		settings: settings.Default(),
-		queue:    []*Item{},
-		wake:     make(chan struct{}, 1),
-		runDone:  make(chan struct{}),
+		host:       host,
+		dataDir:    dataDir,
+		logger:     logger,
+		settings:   settings.Default(),
+		queue:      []*Item{},
+		cancels:    make(map[string]context.CancelFunc),
+		cancelling: make(map[string]bool),
+		wake:       make(chan struct{}, 1),
+		runDone:    make(chan struct{}),
 	}
 }
 
@@ -733,72 +744,143 @@ func (e *Engine) flushIfDue(ctx context.Context) {
 }
 
 // Retry puts a failed or cancelled item back in the queue.
-func (e *Engine) Retry(ctx context.Context, id string) error {
+func (e *Engine) Retry(ctx context.Context, ids ...string) error {
+	if len(ids) == 0 {
+		return errors.New("没有指定队列项")
+	}
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+
 	e.mu.Lock()
-	var target *Item
+	matched, requeued := 0, 0
 	for _, item := range e.queue {
-		if item.ID == id {
-			target = item
-			break
+		if !wanted[item.ID] {
+			continue
 		}
+		matched++
+		// A running item is already doing what a retry would ask for. Skipping
+		// it rather than refusing the whole request is what makes selecting a
+		// screenful of rows and pressing retry behave sensibly.
+		if item.State == StateRunning {
+			continue
+		}
+		item.State = StatePending
+		item.Stage = StageIdle
+		item.Error = ""
+		item.Downloaded = 0
+		item.Uploaded = 0
+		item.UploadJobID = ""
+		item.FinishedAt = 0
+		requeued++
 	}
-	if target == nil {
-		e.mu.Unlock()
-		return errors.New("找不到这个队列项")
+	if requeued > 0 {
+		e.markQueueDirtyLocked()
 	}
-	if target.State == StateRunning {
-		e.mu.Unlock()
-		return errors.New("正在进行中的项目不能重试")
-	}
-	target.State = StatePending
-	target.Stage = StageIdle
-	target.Error = ""
-	target.Downloaded = 0
-	target.Uploaded = 0
-	target.UploadJobID = ""
-	target.FinishedAt = 0
-	e.markQueueDirtyLocked()
 	e.mu.Unlock()
+
+	if matched == 0 {
+		return errors.New("找不到这些队列项")
+	}
+	if requeued == 0 {
+		return errors.New("选中的项目都在进行中，无法重试")
+	}
 	e.persistNow(ctx)
 	e.Wake()
 	return nil
 }
 
-// Cancel drops a queued item. A running one is left alone: interrupting it
-// would strand a partial upload in the storage channel, and it will finish
-// within one file's worth of time anyway.
-func (e *Engine) Cancel(ctx context.Context, id string) error {
+// Cancel stops the named items.
+//
+// A running transfer is interrupted rather than left to finish. Refusing to
+// cancel it meant that pressing 取消 on the file actually moving bytes did
+// nothing at all, so the queue kept uploading something nobody wanted while the
+// page offered no way to stop it. Its context is cancelled, and the upload job
+// it opened in tdrive is aborted so the drive's own record agrees with this
+// one; the transfer goroutine then finds the item already marked cancelled and
+// leaves it alone.
+func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
+	if len(ids) == 0 {
+		return errors.New("没有指定队列项")
+	}
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+
+	type stopping struct {
+		item   *Item
+		jobID  string
+		cancel context.CancelFunc
+	}
+
 	e.mu.Lock()
-	var target *Item
+	matched, cancelled := 0, 0
+	var interrupted []stopping
 	for _, item := range e.queue {
-		if item.ID == id {
-			target = item
-			break
+		if !wanted[item.ID] || item.Finished() {
+			if wanted[item.ID] {
+				matched++
+			}
+			continue
+		}
+		matched++
+		cancelled++
+		if item.State == StateRunning {
+			e.cancelling[item.ID] = true
+			interrupted = append(interrupted, stopping{
+				item: item, jobID: item.UploadJobID, cancel: e.cancels[item.ID],
+			})
+		}
+		item.State = StateCancelled
+		item.Stage = StageIdle
+		item.Error = ""
+		item.FinishedAt = nowMillis()
+	}
+	if cancelled > 0 {
+		e.markQueueDirtyLocked()
+	}
+	e.mu.Unlock()
+
+	if matched == 0 {
+		return errors.New("找不到这些队列项")
+	}
+	if cancelled == 0 {
+		return errors.New("选中的项目都已经结束了")
+	}
+
+	for _, stopped := range interrupted {
+		if stopped.cancel != nil {
+			stopped.cancel()
+		}
+		// Aborting the drive's job is what stops tdrive from showing a transfer
+		// that is still running behind a queue entry that says cancelled.
+		if stopped.jobID != "" {
+			e.abort(ctx, stopped.item, stopped.jobID, "cancelled", "cancelled")
 		}
 	}
-	if target == nil {
-		e.mu.Unlock()
-		return errors.New("找不到这个队列项")
-	}
-	if target.State == StateRunning {
-		e.mu.Unlock()
-		return errors.New("正在进行中的项目无法取消，等它结束后再操作")
-	}
-	target.State = StateCancelled
-	target.Stage = StageIdle
-	target.FinishedAt = nowMillis()
-	e.markQueueDirtyLocked()
-	e.mu.Unlock()
 	e.persistNow(ctx)
 	return nil
 }
 
-// ClearFinished empties the history part of the queue.
-func (e *Engine) ClearFinished(ctx context.Context) {
+// ClearFinished empties the history part of the queue. With ids given it
+// removes only those, which is the per-row and multi-select delete.
+func (e *Engine) ClearFinished(ctx context.Context, ids ...string) {
+	var wanted map[string]bool
+	if len(ids) > 0 {
+		wanted = make(map[string]bool, len(ids))
+		for _, id := range ids {
+			wanted[id] = true
+		}
+	}
+
 	e.mu.Lock()
 	kept := e.queue[:0]
 	for _, item := range e.queue {
-		if !item.Finished() {
+		// Only finished rows are history. Dropping a running one would leave its
+		// goroutine writing to an item nothing can show any more.
+		if !item.Finished() || (wanted != nil && !wanted[item.ID]) {
 			kept = append(kept, item)
 		}
 	}
@@ -806,6 +888,31 @@ func (e *Engine) ClearFinished(ctx context.Context) {
 	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
+}
+
+// watchItem derives the context one transfer runs on and registers it so Cancel
+// can interrupt it.
+func (e *Engine) watchItem(ctx context.Context, id string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	e.cancels[id] = cancel
+	e.mu.Unlock()
+	return ctx, func() {
+		cancel()
+		e.mu.Lock()
+		delete(e.cancels, id)
+		delete(e.cancelling, id)
+		e.mu.Unlock()
+	}
+}
+
+// stoppedByCancel reports whether this transfer ended because somebody
+// cancelled it, in which case the item's state is already recorded and the
+// error it returned is only the shape the cancellation took.
+func (e *Engine) stoppedByCancel(id string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelling[id]
 }
 
 // stagedBytes is how much disk the staging area currently holds.

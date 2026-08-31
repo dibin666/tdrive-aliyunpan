@@ -150,6 +150,12 @@ func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.J
 			return err
 		}
 	}
+	// A job with an explicit file list is not mirroring a directory, so it does
+	// not walk one.
+	if len(job.IncludeFiles) > 0 {
+		return e.scanChosenFiles(ctx, cli, job, drive)
+	}
+
 	excludes := make([]*regexp.Regexp, 0, len(job.ExcludeNames))
 	for _, pattern := range job.ExcludeNames {
 		compiled, err := regexp.Compile(pattern)
@@ -202,6 +208,76 @@ func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.J
 		}
 	}
 	return nil
+}
+
+// scanChosenFiles queues exactly the files a job names, and nothing else.
+//
+// The directories holding them are listed rather than walked: the point of
+// picking files by hand is that the rest of the tree is not wanted, and a
+// listing per directory is also how the size and identity of each file is
+// learned without a call per file. A file that has since been moved or deleted
+// in the cloud is reported rather than passed over, because a job that silently
+// syncs nothing looks identical to one that is working.
+func (e *Engine) scanChosenFiles(
+	ctx context.Context,
+	cli *aliyunpan.CLI,
+	job settings.Job,
+	drive aliyunpan.Drive,
+) error {
+	byDirectory := make(map[string][]string)
+	order := make([]string, 0, len(job.IncludeFiles))
+	for _, path := range job.IncludeFiles {
+		parent := parentCloudDir(path)
+		if _, seen := byDirectory[parent]; !seen {
+			order = append(order, parent)
+		}
+		byDirectory[parent] = append(byDirectory[parent], path)
+	}
+
+	var missing []string
+	for _, cloudDir := range order {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries, err := cli.List(ctx, cloudDir, drive.ID)
+		if err != nil {
+			return err
+		}
+		found := make(map[string]aliyunpan.Entry, len(entries))
+		for _, entry := range entries {
+			if !entry.IsDir {
+				found[entry.Path] = entry
+			}
+		}
+
+		targetDir := mapPath(job.RemotePath, job.TargetPath, cloudDir)
+		existing, err := e.driveIndex(ctx, targetDir)
+		if err != nil {
+			return err
+		}
+		for _, wanted := range byDirectory[cloudDir] {
+			entry, ok := found[wanted]
+			if !ok {
+				missing = append(missing, wanted)
+				continue
+			}
+			e.consider(job, entry, targetDir, existing)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("选定的文件在云盘上找不到: %s", strings.Join(missing, "、"))
+	}
+	return nil
+}
+
+// parentCloudDir is the directory holding a cloud path.
+func parentCloudDir(path string) string {
+	index := strings.LastIndexByte(path, '/')
+	if index <= 0 {
+		return "/"
+	}
+	return path[:index]
 }
 
 // driveIndex reads the drive directory a cloud directory maps onto, so the

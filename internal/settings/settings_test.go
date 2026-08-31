@@ -194,3 +194,49 @@ func TestCleanCloudPath(t *testing.T) {
 		}
 	}
 }
+
+// A picked file's destination is worked out by rebasing it from the job's cloud
+// directory. One outside that directory has no destination at all, and guessing
+// one would put the file somewhere nobody named.
+func TestNormalizeRejectsAPickedFileOutsideTheJobDirectory(t *testing.T) {
+	document := Settings{Jobs: []Job{{
+		ID: "j1", DriveName: "backup", RemotePath: "/动画", TargetPath: "/动画",
+		IncludeFiles: []string{"/电影/a.mkv"},
+	}}}
+	if err := document.Normalize(); err == nil {
+		t.Fatal("a picked file outside the job's cloud directory was accepted")
+	}
+}
+
+func TestNormalizeCleansAndDedupesPickedFiles(t *testing.T) {
+	document := Settings{Jobs: []Job{{
+		ID: "j1", DriveName: "backup", RemotePath: "/动画", TargetPath: "/动画",
+		IncludeFiles: []string{
+			"/动画//01.ts", " /动画/01.ts ", "/动画/第一季/./ep1.mkv", "", "/",
+		},
+	}}}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	got := document.Jobs[0].IncludeFiles
+	want := []string{"/动画/01.ts", "/动画/第一季/ep1.mkv"}
+	if len(got) != len(want) {
+		t.Fatalf("IncludeFiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("IncludeFiles = %v, want %v", got, want)
+		}
+	}
+}
+
+// A job rooted at "/" holds everything, so no file can be outside it.
+func TestNormalizeAcceptsPickedFilesUnderTheRoot(t *testing.T) {
+	document := Settings{Jobs: []Job{{
+		ID: "j1", DriveName: "backup", RemotePath: "/", TargetPath: "/云盘",
+		IncludeFiles: []string{"/a.mkv"},
+	}}}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+}

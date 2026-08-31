@@ -365,6 +365,59 @@
       .picker button:hover {
         background: var(--sunk);
       }
+      .picker .size {
+        margin-left: auto;
+        color: var(--faint);
+        font-size: 0.75rem;
+        white-space: nowrap;
+      }
+
+      /* The multi-select box, drawn rather than native so it can show the
+         indeterminate state a partly-selected "select all" needs, and so it
+         matches tdrive's own lists. */
+      .check {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1rem;
+        height: 1rem;
+        flex: none;
+        border: 1px solid var(--line-strong);
+        border-radius: 4px;
+        background: transparent;
+        color: #fff;
+        font-size: 0.625rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0;
+      }
+      .check[data-on='true'],
+      .check[data-on='mixed'] {
+        background: var(--color-clay);
+        border-color: var(--color-clay);
+      }
+      /* A 16px box is not a target. The padded wrapper is. */
+      .check-hit {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.375rem;
+        margin: -0.375rem;
+        background: transparent;
+        border: 0;
+        cursor: pointer;
+        flex: none;
+      }
+      .select-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--line);
+        background: var(--clay-soft);
+        font-size: 0.8125rem;
+      }
       .modal-backdrop {
         position: fixed;
         inset: 0;
@@ -491,6 +544,9 @@
         filters: new Set(),
         jobFilter: '',
         expanded: new Set(),
+        // Ids of the queue rows that are ticked. Kept here rather than in the
+        // DOM because the list repaints on every poll.
+        selected: new Set(),
         density: localStorage.getItem('tdrive.transferDensity') || 'compact',
         loading: false,
         lastLoad: 0,
@@ -776,11 +832,12 @@
           '<div class="card" style="padding:0">',
           rows.length === 0
             ? '<div class="empty">没有符合条件的传输</div>'
-            : '<div class="rows" data-density="' +
-              state.density +
-              '">' +
-              rows.map((row) => transferRow(row, now)).join('') +
-              '</div>',
+            : selectionBar(rows) +
+              '<div class="rows" data-density="' +
+                state.density +
+                '">' +
+                rows.map((row) => transferRow(row, now)).join('') +
+                '</div>',
           '</div>',
           '<div class="hint">暂存目录 ' +
             esc(snapshot.stageDir) +
@@ -814,6 +871,67 @@
           '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6 18.4 18.4"/></svg>',
       }
 
+      /**
+       * selectionBar heads the queue with a select-all box and, once something
+       * is ticked, the actions that apply to every ticked row.
+       *
+       * Cancelling or retrying a hundred queued files one row at a time was the
+       * only way to do it, which in practice meant not doing it.
+       */
+      function selectionBar(rows) {
+        // Only what is on screen can be selected, so "all" means the current
+        // filter rather than the whole queue.
+        const visible = rows.map((row) => row.id)
+        const chosen = visible.filter((id) => state.selected.has(id))
+        const stateOf = chosen.length === 0 ? 'false' : chosen.length === visible.length ? 'true' : 'mixed'
+
+        const selectedRows = rows.filter((row) => state.selected.has(row.id))
+        const stoppable = selectedRows.filter((row) => !FINISHED_STATES.has(row.state)).length
+        const retryable = selectedRows.filter((row) => row.state !== 'running').length
+        const removable = selectedRows.filter((row) => FINISHED_STATES.has(row.state)).length
+
+        return [
+          '<div class="select-bar">',
+          checkbox(stateOf, 'select-all-rows', chosen.length === visible.length ? '取消全选' : '全选'),
+          chosen.length > 0
+            ? '<span>已选 ' + chosen.length + ' / ' + visible.length + ' 项</span>'
+            : '<span style="color:var(--muted)">' + visible.length + ' 项</span>',
+          '<span class="grow"></span>',
+          chosen.length > 0
+            ? [
+                retryable > 0
+                  ? '<button class="btn btn-ghost" id="bulk-retry" type="button" style="padding:.25rem .5rem;font-size:.75rem">重试 ' + retryable + ' 项</button>'
+                  : '',
+                stoppable > 0
+                  ? '<button class="btn btn-ghost" id="bulk-cancel" type="button" style="padding:.25rem .5rem;font-size:.75rem">取消 ' + stoppable + ' 项</button>'
+                  : '',
+                removable > 0
+                  ? '<button class="btn btn-danger" id="bulk-delete" type="button" style="padding:.25rem .5rem;font-size:.75rem">删除 ' + removable + ' 条记录</button>'
+                  : '',
+                '<button class="btn btn-ghost" id="clear-selection" type="button" style="padding:.25rem .5rem;font-size:.75rem">取消选择</button>',
+              ].join('')
+            : '',
+          '</div>',
+        ].join('')
+      }
+
+      // States a transfer never leaves. Cancelling one is meaningless and
+      // deleting a running one would orphan its goroutine.
+      const FINISHED_STATES = new Set(['complete', 'failed', 'cancelled'])
+
+      /** checkbox renders one drawn box. `on` is 'true', 'false' or 'mixed'. */
+      function checkbox(on, id, label, dataset) {
+        return (
+          '<button class="check-hit" type="button"' +
+          (id ? ' id="' + esc(id) + '"' : '') +
+          (dataset ? ' data-check="' + esc(dataset) + '"' : '') +
+          ' aria-label="' + esc(label) + '" title="' + esc(label) + '">' +
+          '<span class="check" data-on="' + on + '">' +
+          (on === 'mixed' ? '–' : on === 'true' ? '✓' : '') +
+          '</span></button>'
+        )
+      }
+
       function transferRow(row, now) {
         // The bar tracks whichever half is running: disk on the way in,
         // Telegram on the way out. Mixing them into one number would make a
@@ -829,6 +947,12 @@
           '<div class="trow" data-row="' + esc(row.id) + '">',
           percent > 0 ? '<div class="fill" style="width:' + percent.toFixed(1) + '%"></div>' : '',
           '<div class="body">',
+          checkbox(
+            state.selected.has(row.id) ? 'true' : 'false',
+            '',
+            (state.selected.has(row.id) ? '取消选择 ' : '选择 ') + row.name,
+            row.id,
+          ),
           ICONS[row.state] || ICONS.pending,
           '<span class="name" title="' + esc(row.remotePath) + '">' + esc(row.name) + '</span>',
           '<span class="chip">' + esc(row.jobName || '任务') + '</span>',
@@ -838,10 +962,12 @@
               (speed > 0 ? ' · ' + esc(rate(speed)) : '')
             : esc(STATUS_LABEL[row.state] + ' · ' + bytes(row.total)),
           '</span>',
-          row.state === 'failed'
+          row.state === 'failed' || row.state === 'cancelled'
             ? '<button class="btn btn-ghost" data-retry="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">重试</button>'
             : '',
-          row.state === 'pending'
+          // Offered for a running transfer too, now that cancelling one
+          // actually stops it rather than being refused.
+          !FINISHED_STATES.has(row.state)
             ? '<button class="btn btn-ghost" data-cancel="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">取消</button>'
             : '',
           '</div>',
@@ -892,6 +1018,9 @@
                     esc(job.targetPath) +
                     '</div>' +
                     '</div>' +
+                    ((job.includeFiles || []).length > 0
+                      ? '<span class="chip">只同步 ' + job.includeFiles.length + ' 个文件</span>'
+                      : '') +
                     (job.deleteAfterUpload
                       ? '<span class="chip danger-text">上传后删除云端</span>'
                       : '') +
@@ -1077,9 +1206,9 @@
       function renderOverlay(force) {
         const overlay = document.getElementById('overlay')
           const key = state.picker
-          ? ['picker', state.picker.request, state.picker.kind, state.picker.driveName, state.picker.path, state.picker.loading, state.picker.error].join('|')
+          ? ['picker', state.picker.request, state.picker.kind, state.picker.driveName, state.picker.path, state.picker.loading, state.picker.error, state.picker.chosen.size].join('|')
           : state.editing
-            ? 'job|' + (state.editing.id || 'new')
+            ? 'job|' + (state.editing.id || 'new') + '|' + ((state.editing.includeFiles || []).length)
             : ''
         if (!force && key === overlayKey) return
         overlayKey = key
@@ -1106,7 +1235,9 @@
           '<div class="field-wide">' +
             '<label class="label">云盘目录</label>' +
             '<div class="toolbar"><input class="input" id="job-remote" value="' + esc(job.remotePath || '/') + '">' +
-            '<button class="btn btn-outline" data-pick="remote" type="button">浏览</button></div></div>',
+            '<button class="btn btn-outline" data-pick="remote" type="button">浏览</button></div>' +
+            includedFilesField(job) +
+            '</div>',
           '<div class="field-wide">' +
             '<label class="label">tdrive 目标目录</label>' +
             '<div class="toolbar"><input class="input" id="job-target" value="' + esc(job.targetPath || '/') + '">' +
@@ -1136,28 +1267,88 @@
         ].join('')
       }
 
+      /**
+       * includedFilesField reports whether the job is mirroring a directory or
+       * syncing a hand-picked list, because those behave very differently and
+       * the difference is otherwise invisible on the form.
+       */
+      function includedFilesField(job) {
+        const files = job.includeFiles || []
+        if (files.length === 0) {
+          return '<div class="hint">同步整个目录（含子目录）。用「浏览」勾选文件可以只同步其中几个。</div>'
+        }
+        const preview = files.slice(0, 6).map((path) => '<div>' + esc(path) + '</div>').join('')
+        return (
+          '<div class="warn-box" style="margin-top:.5rem">' +
+          '<div class="toolbar"><span>只同步勾选的 ' + files.length + ' 个文件</span><span class="grow"></span>' +
+          '<button class="btn btn-ghost" id="job-clear-files" type="button" style="padding:.125rem .375rem;font-size:.75rem">改为整个目录</button></div>' +
+          '<div class="mono" style="margin-top:.375rem;color:inherit">' +
+          preview +
+          (files.length > 6 ? '<div>…还有 ' + (files.length - 6) + ' 个</div>' : '') +
+          '</div></div>'
+        )
+      }
+
       function pickerModal(picker) {
+        const remote = picker.kind === 'remote'
+        const chosen = picker.chosen ? picker.chosen.size : 0
+        const entries = picker.entries || []
+        const files = entries.filter((entry) => !entry.isDir)
+        const allFilesChosen = files.length > 0 && files.every((entry) => picker.chosen.has(entry.path))
+
+        const row = (entry) => {
+          if (entry.isDir) {
+            return (
+              '<button data-picker-go="' + esc(entry.path) + '" type="button">📁 ' +
+              esc(entry.name) + '</button>'
+            )
+          }
+          // A file is ticked, not entered, so the whole row toggles it.
+          return (
+            '<button data-pick-file="' + esc(entry.path) + '" type="button">' +
+            '<span class="check" data-on="' + (picker.chosen.has(entry.path) ? 'true' : 'false') + '">' +
+            (picker.chosen.has(entry.path) ? '✓' : '') +
+            '</span>📄 ' + esc(entry.name) +
+            '<span class="size">' + esc(bytes(entry.size)) + '</span></button>'
+          )
+        }
+
         return [
           '<div class="modal-backdrop" data-close-modal="1"><div class="modal">',
-          '<h2>' + (picker.kind === 'remote' ? '选择' + driveLabel(picker.driveName) + '目录' : '选择 tdrive 目录') + '</h2>',
+          '<h2>' + (remote ? '选择' + driveLabel(picker.driveName) + '目录或文件' : '选择 tdrive 目录') + '</h2>',
           '<div class="mono" style="margin-bottom:.5rem">' + esc(picker.path) + '</div>',
+          remote
+            ? '<div class="hint" style="margin:-.25rem 0 .5rem">不勾选任何文件就同步整个目录；勾选之后只同步勾选的这些，勾选可以跨目录保留。</div>'
+            : '',
           picker.error ? '<div class="error-box">' + esc(picker.error) + '</div>' : '',
+          remote && files.length > 0 && !picker.loading
+            ? '<div class="toolbar" style="margin-bottom:.375rem">' +
+              checkbox(
+                allFilesChosen ? 'true' : chosen > 0 ? 'mixed' : 'false',
+                'picker-select-all',
+                allFilesChosen ? '取消全选' : '全选本目录文件',
+              ) +
+              '<span class="hint" style="margin:0">' +
+              (chosen > 0 ? '已勾选 ' + chosen + ' 个文件' : files.length + ' 个文件') +
+              '</span></div>'
+            : '',
           '<div class="picker">',
           picker.path !== '/'
             ? '<button data-picker-go="' + esc(parentOf(picker.path)) + '" type="button">.. 上一级</button>'
             : '',
           picker.loading
             ? '<button type="button" disabled>加载中…</button>'
-            : (picker.entries || [])
-                .map(
-                  (entry) =>
-                    '<button data-picker-go="' + esc(entry.path) + '" type="button">📁 ' + esc(entry.name) + '</button>',
-                )
-                .join('') || '<button type="button" disabled>这里没有子目录</button>',
+            : entries.map(row).join('') ||
+              '<button type="button" disabled>' + (remote ? '这个目录是空的' : '这里没有子目录') + '</button>',
           '</div>',
           '<div class="modal-actions">',
+          chosen > 0
+            ? '<button class="btn btn-ghost" id="picker-clear" type="button">清空勾选</button>'
+            : '',
           '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
-          '<button class="btn btn-primary" id="picker-choose" type="button">选择当前目录</button>',
+          '<button class="btn btn-primary" id="picker-choose" type="button">' +
+            (chosen > 0 ? '使用勾选的 ' + chosen + ' 个文件' : '选择当前目录') +
+            '</button>',
           '</div>',
           '</div></div>',
         ].join('')
@@ -1172,9 +1363,27 @@
       // --------------------------------------------------------------- events
 
       document.addEventListener('click', async (event) => {
-        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
+        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-check],[data-pick-file],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
         if (!target) return
 
+        if (target.dataset.check !== undefined) {
+          // Ticking a row must not also expand it, which is what a click
+          // anywhere else on the row does.
+          event.stopPropagation()
+          const id = target.dataset.check
+          if (state.selected.has(id)) state.selected.delete(id)
+          else state.selected.add(id)
+          render()
+          return
+        }
+        if (target.dataset.pickFile !== undefined) {
+          event.stopPropagation()
+          const path = target.dataset.pickFile
+          if (state.picker.chosen.has(path)) state.picker.chosen.delete(path)
+          else state.picker.chosen.add(path)
+          renderOverlay(true)
+          return
+        }
         if (target.dataset.tab) {
           state.tab = target.dataset.tab
           localStorage.setItem('tdrive.aliyunpan.tab', state.tab)
@@ -1254,16 +1463,74 @@
             return
           case 'clear-btn':
             await act('/queue/clear', null, '历史已清空')
+            state.selected.clear()
             return
+          case 'select-all-rows': {
+            const visible = visibleRowIds()
+            const allChosen = visible.length > 0 && visible.every((id) => state.selected.has(id))
+            if (allChosen) visible.forEach((id) => state.selected.delete(id))
+            else visible.forEach((id) => state.selected.add(id))
+            render()
+            return
+          }
+          case 'clear-selection':
+            state.selected.clear()
+            render()
+            return
+          case 'bulk-retry':
+            await bulkQueue('/queue/retry', (row) => row.state !== 'running', '已重新排队')
+            return
+          case 'bulk-cancel': {
+            const stopping = selectedRows().filter((row) => !FINISHED_STATES.has(row.state))
+            const running = stopping.filter((row) => row.state === 'running').length
+            if (
+              running > 0 &&
+              !window.confirm(
+                '其中 ' + running + ' 个文件正在传输，取消会中断它们并删除 tdrive 里已写入的部分。继续吗？',
+              )
+            ) {
+              return
+            }
+            await bulkQueue('/queue/cancel', (row) => !FINISHED_STATES.has(row.state), '已取消')
+            return
+          }
+          case 'bulk-delete': {
+            const removable = selectedRows().filter((row) => FINISHED_STATES.has(row.state))
+            if (!window.confirm('删除选中的 ' + removable.length + ' 条记录？文件本身留在 tdrive 里。')) return
+            await bulkQueue('/queue/delete', (row) => FINISHED_STATES.has(row.state), '记录已删除')
+            return
+          }
           case 'new-job':
-            state.editing = { enabled: true, driveName: 'backup', remotePath: '/', targetPath: '/阿里云盘' }
+            state.editing = {
+              enabled: true, driveName: 'backup', remotePath: '/',
+              targetPath: '/阿里云盘', includeFiles: [],
+            }
             renderOverlay(true)
             return
           case 'save-job':
             await saveJob()
             return
+          case 'job-clear-files':
+            captureJobForm()
+            state.editing.includeFiles = []
+            renderOverlay(true)
+            return
           case 'picker-choose':
             applyPicker()
+            return
+          case 'picker-select-all': {
+            const files = (state.picker.entries || []).filter((entry) => !entry.isDir)
+            const allChosen = files.length > 0 && files.every((entry) => state.picker.chosen.has(entry.path))
+            files.forEach((entry) => {
+              if (allChosen) state.picker.chosen.delete(entry.path)
+              else state.picker.chosen.add(entry.path)
+            })
+            renderOverlay(true)
+            return
+          }
+          case 'picker-clear':
+            state.picker.chosen.clear()
+            renderOverlay(true)
             return
           case 'save-plan':
             await savePlan()
@@ -1313,6 +1580,49 @@
         }
       })
 
+      // ------------------------------------------------------------ selection
+
+      /** visibleRows is the queue under the current filters — the same list the
+       *  view draws, so "全选" cannot select something that is not on screen. */
+      function visibleRows() {
+        const rows = (state.snapshot && state.snapshot.rows) || []
+        return rows
+          .filter((row) => (state.filters.size === 0 ? true : state.filters.has(row.state)))
+          .filter((row) => (state.jobFilter ? row.jobId === state.jobFilter : true))
+      }
+
+      function visibleRowIds() {
+        return visibleRows().map((row) => row.id)
+      }
+
+      function selectedRows() {
+        return visibleRows().filter((row) => state.selected.has(row.id))
+      }
+
+      /**
+       * bulkQueue posts one request for every selected row an action can apply
+       * to, and drops those rows from the selection afterwards.
+       *
+       * The rows that do not qualify are filtered out here rather than being
+       * sent and rejected: selecting a screenful and pressing 取消 should stop
+       * what can be stopped, not fail because one row had already finished.
+       */
+      async function bulkQueue(endpoint, applies, message) {
+        const ids = selectedRows().filter(applies).map((row) => row.id)
+        if (ids.length === 0) {
+          toast('选中的项目都不适用这个操作', 'error')
+          return
+        }
+        try {
+          await call(endpoint, { method: 'POST', body: JSON.stringify({ ids }) })
+          ids.forEach((id) => state.selected.delete(id))
+          toast(message + ' ' + ids.length + ' 项')
+          await load(true)
+        } catch (error) {
+          toast(error.message, 'error')
+        }
+      }
+
       // ---------------------------------------------------------------- forms
 
       async function loadSettings() {
@@ -1335,6 +1645,8 @@
 
       function captureJobForm() {
         if (!state.editing) return
+        // includeFiles has no input of its own — it comes from the picker — so
+        // it rides along on the spread rather than being read back off the form.
         state.editing = {
           ...state.editing,
           name: value('job-name'),
@@ -1404,11 +1716,26 @@
         }
       }
 
+      /**
+       * openPicker browses one directory.
+       *
+       * The cloud side lists files as well as directories so specific files can
+       * be ticked; the tdrive side is a destination and only ever a directory.
+       * The ticks survive navigating around, because the files somebody wants
+       * are rarely all in one folder.
+       */
       async function openPicker(kind, path) {
         const selectedPath = path || '/'
         const driveName = state.editing && state.editing.driveName ? state.editing.driveName : 'backup'
         const request = ++state.pickerRequest
-        state.picker = { request, kind, driveName, path: selectedPath, loading: true, entries: [], error: '' }
+        const chosen =
+          state.picker && state.picker.kind === kind
+            ? state.picker.chosen
+            : new Set(kind === 'remote' ? (state.editing && state.editing.includeFiles) || [] : [])
+        state.picker = {
+          request, kind, driveName, chosen,
+          path: selectedPath, loading: true, entries: [], error: '',
+        }
         renderOverlay(true)
         const endpoint = kind === 'remote' ? '/browse' : '/drive/browse'
         try {
@@ -1418,7 +1745,7 @@
               encodeURIComponent(selectedPath) +
               (kind === 'remote' ? '&driveName=' + encodeURIComponent(driveName) : ''),
           )
-          const entries = (result.entries || []).filter((entry) => entry.isDir)
+          const entries = (result.entries || []).filter((entry) => kind === 'remote' || entry.isDir)
           if (!state.picker || state.picker.request !== request) return
           state.picker = { ...state.picker, path: result.path, entries, loading: false }
         } catch (error) {
@@ -1428,12 +1755,49 @@
         renderOverlay(true)
       }
 
+      /**
+       * applyPicker writes the picker's result back into the job form.
+       *
+       * Ticking files means "sync exactly these"; ticking none means "mirror
+       * this directory", which is what the job did before any of this existed.
+       * Both are recorded together so the two halves cannot disagree: the cloud
+       * directory is always the one being looked at when the choice was made.
+       */
       function applyPicker() {
         if (!state.picker || !state.editing) return
-        if (state.picker.kind === 'remote') state.editing.remotePath = state.picker.path
-        else state.editing.targetPath = state.picker.path
+        if (state.picker.kind !== 'remote') {
+          state.editing.targetPath = state.picker.path
+          state.picker = null
+          renderOverlay(true)
+          return
+        }
+
+        const chosen = [...state.picker.chosen]
+        if (chosen.length === 0) {
+          state.editing.remotePath = state.picker.path
+          state.editing.includeFiles = []
+        } else {
+          // The job's directory has to contain everything ticked, or the server
+          // rejects the job. The deepest shared ancestor is the only choice that
+          // always does and never pulls in more of the tree than it must.
+          state.editing.remotePath = commonCloudDir(chosen)
+          state.editing.includeFiles = chosen
+        }
         state.picker = null
         renderOverlay(true)
+      }
+
+      /** commonCloudDir is the deepest directory holding every given path. */
+      function commonCloudDir(paths) {
+        let parts = parentOf(paths[0]).split('/')
+        for (const path of paths.slice(1)) {
+          const other = parentOf(path).split('/')
+          let index = 0
+          while (index < parts.length && index < other.length && parts[index] === other[index]) index++
+          parts = parts.slice(0, index)
+        }
+        const joined = parts.join('/')
+        return joined === '' ? '/' : joined
       }
 
       // Follow the main interface when the theme is changed in another tab.

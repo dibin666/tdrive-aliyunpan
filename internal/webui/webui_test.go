@@ -243,3 +243,30 @@ func TestPauseAndResume(t *testing.T) {
 		t.Fatalf("resume status = %d", response.Status)
 	}
 }
+
+// The per-row buttons still send one id in the query string; the multi-select
+// bar sends a list in the body. Both have to reach the same engine call.
+func TestQueueIDsReadsBothShapes(t *testing.T) {
+	ids, err := queueIDs(nil, "one")
+	if err != nil || len(ids) != 1 || ids[0] != "one" {
+		t.Fatalf("queueIDs(query) = %v, %v", ids, err)
+	}
+
+	ids, err = queueIDs([]byte(`{"ids":["a"," b ","","a"]}`), "")
+	if err != nil {
+		t.Fatalf("queueIDs(body): %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "a" || ids[1] != "b" {
+		t.Fatalf("queueIDs(body) = %v, want the trimmed, deduped pair", ids)
+	}
+
+	if _, err := queueIDs([]byte(`{"ids":[]}`), ""); err == nil {
+		t.Error("an empty selection was accepted")
+	}
+	if _, err := queueIDs(nil, "  "); err == nil {
+		t.Error("a blank id was accepted")
+	}
+	if _, err := queueIDs([]byte("not json"), ""); err == nil {
+		t.Error("a malformed body was accepted")
+	}
+}

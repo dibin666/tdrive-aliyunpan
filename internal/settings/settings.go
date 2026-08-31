@@ -70,6 +70,16 @@ type Job struct {
 	DriveName  string `json:"driveName"`
 	RemotePath string `json:"remotePath"`
 	TargetPath string `json:"targetPath"`
+	// IncludeFiles turns the job from "mirror this directory" into "sync
+	// exactly these files". They are absolute cloud paths under RemotePath,
+	// picked in the browser, and when the list is non-empty the scan does not
+	// walk the tree at all — it looks only at the directories holding them.
+	//
+	// The size and exclude filters are deliberately not applied to them.
+	// Choosing a file by hand is a more specific instruction than a rule that
+	// was written to describe a directory, and silently dropping a file
+	// somebody ticked would be the worst of both.
+	IncludeFiles []string `json:"includeFiles,omitempty"`
 	// ExcludeNames are Go regular expressions matched against each entry's
 	// name; a matching directory is not descended into.
 	ExcludeNames []string `json:"excludeNames"`
@@ -209,6 +219,31 @@ func (j *Job) normalize() error {
 	if err := checkPathText("tdrive 目标路径", j.TargetPath); err != nil {
 		return fmt.Errorf("任务 %s: %w", j.Name, err)
 	}
+	// Every picked file has to live under the job's cloud directory, because
+	// that directory is what the target path is rebased from. One outside it has
+	// no defined destination, and guessing one would put the file somewhere the
+	// operator never named.
+	includes := make([]string, 0, len(j.IncludeFiles))
+	seenInclude := make(map[string]bool, len(j.IncludeFiles))
+	for _, path := range j.IncludeFiles {
+		cleaned := CleanCloudPath(path)
+		if cleaned == "" || cleaned == "/" {
+			continue
+		}
+		if err := checkPathText("选定文件", cleaned); err != nil {
+			return fmt.Errorf("任务 %s: %w", j.Name, err)
+		}
+		if j.RemotePath != "/" && !strings.HasPrefix(cleaned, j.RemotePath+"/") {
+			return fmt.Errorf("任务 %s 选定的文件 %s 不在云盘目录 %s 里", j.Name, cleaned, j.RemotePath)
+		}
+		if seenInclude[cleaned] {
+			continue
+		}
+		seenInclude[cleaned] = true
+		includes = append(includes, cleaned)
+	}
+	j.IncludeFiles = includes
+
 	if j.MinSizeBytes < 0 || j.MaxSizeBytes < 0 {
 		return fmt.Errorf("任务 %s 的大小过滤不能为负数", j.Name)
 	}
