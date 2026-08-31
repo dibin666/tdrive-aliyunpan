@@ -1,0 +1,1394 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>阿里云盘同步</title>
+    <script>
+      // The same pre-paint snippet tdrive's own shell uses. This page is
+      // same-origin, so it reads the identical localStorage key and a reload
+      // in dark mode never flashes the light background.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('tdrive.theme')
+          var dark = stored ? stored === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {}
+      })()
+    </script>
+    <script>
+      // tdrive fingerprints its stylesheet, so the href cannot be hard-coded.
+      // The app shell is served without authentication, which makes reading
+      // the current hash out of it the cheapest way to stay in step with the
+      // main interface across rebuilds. The fallback below keeps the page
+      // usable if that ever fails.
+      ;(function () {
+        fetch('/', { credentials: 'same-origin' })
+          .then(function (response) {
+            return response.ok ? response.text() : ''
+          })
+          .then(function (html) {
+            var match = html.match(/href="(\/assets\/index-[^"]+\.css)"/)
+            if (!match) return
+            var link = document.createElement('link')
+            link.rel = 'stylesheet'
+            link.href = match[1]
+            document.head.appendChild(link)
+          })
+          .catch(function () {})
+      })()
+    </script>
+    <style>
+      /* Fallback tokens, overwritten the moment tdrive's stylesheet lands.
+         They exist so a failed fetch degrades to something readable rather
+         than to unstyled HTML. */
+      :root {
+        --bg: #faf9f5;
+        --surface: #fff;
+        --sunk: #f2f0e9;
+        --line: #e5e3dc;
+        --line-strong: #d5d2c7;
+        --ink: #1f1e1d;
+        --muted: #6b6963;
+        --faint: #97948b;
+        --clay-soft: #f4e6df;
+        --danger-soft: #f6e3de;
+        --color-clay: #d97757;
+        --color-danger: #b4462f;
+        --color-success: #4a7c59;
+        --color-warn: #a2762f;
+        --radius-control: 8px;
+        --radius-card: 12px;
+        --radius-panel: 16px;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      html.dark {
+        --bg: #262624;
+        --surface: #30302e;
+        --sunk: #212120;
+        --line: #3d3d3a;
+        --line-strong: #4d4d49;
+        --ink: #f5f4ee;
+        --muted: #a3a096;
+        --faint: #7c7a72;
+        --clay-soft: #3a2a24;
+        --danger-soft: #3b241f;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--ink);
+      }
+
+      /* Layout. Everything below composes tdrive's component classes with the
+         same variables, so it inherits the interface's palette rather than
+         re-stating it. */
+      .shell {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        min-height: 0;
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        flex-wrap: wrap;
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid var(--line);
+      }
+      .topbar h1 {
+        margin: 0;
+        font-size: 1.05rem;
+        font-weight: 500;
+      }
+      .status-line {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        min-width: 0;
+        flex: 1;
+      }
+      .tabs {
+        display: flex;
+        gap: 0.25rem;
+        padding: 0.5rem 1rem 0;
+        border-bottom: 1px solid var(--line);
+        overflow-x: auto;
+      }
+      .tab {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        font-size: 0.875rem;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 2px solid transparent;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .tab[data-active='true'] {
+        color: var(--ink);
+        border-bottom-color: var(--color-clay);
+        font-weight: 500;
+      }
+      .scroll {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      .page {
+        max-width: 60rem;
+        margin: 0 auto;
+        padding: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      .section-title {
+        font-size: 0.8125rem;
+        font-weight: 500;
+        color: var(--muted);
+        margin: 0 0 0.5rem;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-card);
+        padding: 0.875rem 1rem;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+        gap: 0.75rem;
+      }
+      .stat {
+        background: var(--sunk);
+        border-radius: var(--radius-control);
+        padding: 0.5rem 0.75rem;
+      }
+      .stat .k {
+        font-size: 0.6875rem;
+        color: var(--faint);
+      }
+      .stat .v {
+        font-size: 0.9375rem;
+        margin-top: 0.125rem;
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+      }
+      .filter {
+        cursor: pointer;
+        border: 1px solid var(--line);
+        background: var(--sunk);
+        color: var(--muted);
+        font-size: 0.6875rem;
+        padding: 0.1875rem 0.5rem;
+        border-radius: 999px;
+      }
+      .filter[data-active='true'] {
+        background: var(--clay-soft);
+        color: var(--color-clay);
+        border-color: transparent;
+      }
+      .grow {
+        flex: 1;
+      }
+      /* An .input is full-width by design, which would push the button next to
+         it onto its own line inside a toolbar row. */
+      .toolbar .input {
+        flex: 1;
+        width: auto;
+        min-width: 10rem;
+      }
+
+      /* Transfer rows. Progress is the row's own background rather than a
+         separate bar — the same choice tdrive's 传输 page makes, and the
+         reason a compact row still shows how far along it is. */
+      .rows {
+        display: flex;
+        flex-direction: column;
+      }
+      .trow {
+        position: relative;
+        border-bottom: 1px solid var(--line);
+        padding: 0.6875rem 0.75rem;
+        cursor: pointer;
+      }
+      .rows[data-density='compact'] .trow {
+        padding: 0.375rem 0.75rem;
+      }
+      .trow:last-child {
+        border-bottom: 0;
+      }
+      .trow .fill {
+        position: absolute;
+        inset-block: 0;
+        left: 0;
+        background: var(--clay-soft);
+        opacity: 0.6;
+        transition: width 200ms linear;
+      }
+      .trow .body {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 0.625rem;
+        min-width: 0;
+      }
+      .trow .name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.875rem;
+      }
+      .trow .meta {
+        font-size: 0.75rem;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .icon {
+        width: 1rem;
+        height: 1rem;
+        flex: none;
+        color: var(--muted);
+      }
+      .icon.ok {
+        color: var(--color-success);
+      }
+      .icon.bad {
+        color: var(--color-danger);
+      }
+      .icon.run {
+        color: var(--color-clay);
+        animation: spin 1.6s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .detail {
+        position: relative;
+        margin-top: 0.5rem;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+        gap: 0.375rem 1rem;
+        font-size: 0.75rem;
+      }
+      .detail dt {
+        color: var(--faint);
+      }
+      .detail dd {
+        margin: 0.0625rem 0 0;
+        color: var(--muted);
+        word-break: break-all;
+      }
+      .empty {
+        text-align: center;
+        color: var(--muted);
+        font-size: 0.875rem;
+        padding: 2rem 0;
+      }
+      .form {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+        gap: 0.75rem;
+      }
+      .field-wide {
+        grid-column: 1 / -1;
+      }
+      .hint {
+        font-size: 0.75rem;
+        color: var(--faint);
+        margin-top: 0.25rem;
+      }
+      .switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.875rem;
+        cursor: pointer;
+      }
+      .danger-text {
+        color: var(--color-danger);
+      }
+      .warn-box {
+        background: var(--clay-soft);
+        color: var(--color-clay);
+        border-radius: var(--radius-control);
+        padding: 0.5rem 0.75rem;
+        font-size: 0.8125rem;
+      }
+      .error-box {
+        background: var(--danger-soft);
+        color: var(--color-danger);
+        border-radius: var(--radius-control);
+        padding: 0.5rem 0.75rem;
+        font-size: 0.8125rem;
+        word-break: break-all;
+      }
+      .mono {
+        font-family: var(--font-mono);
+        font-size: 0.75rem;
+        word-break: break-all;
+      }
+      .picker {
+        border: 1px solid var(--line);
+        border-radius: var(--radius-control);
+        max-height: 15rem;
+        overflow-y: auto;
+      }
+      .picker button {
+        display: flex;
+        width: 100%;
+        gap: 0.5rem;
+        align-items: center;
+        border: 0;
+        background: transparent;
+        color: var(--ink);
+        text-align: left;
+        font-size: 0.8125rem;
+        padding: 0.4375rem 0.625rem;
+        cursor: pointer;
+      }
+      .picker button:hover {
+        background: var(--sunk);
+      }
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgb(0 0 0 / 0.25);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem;
+        z-index: 50;
+      }
+      .modal {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-panel);
+        width: min(38rem, 100%);
+        max-height: 90vh;
+        overflow-y: auto;
+        padding: 1rem 1.125rem;
+      }
+      .modal h2 {
+        margin: 0 0 0.75rem;
+        font-size: 1rem;
+        font-weight: 500;
+      }
+      .modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 0.5rem;
+        margin-top: 1rem;
+      }
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 1.25rem;
+        transform: translateX(-50%);
+        background: var(--surface);
+        border: 1px solid var(--line-strong);
+        border-radius: var(--radius-control);
+        padding: 0.5rem 0.875rem;
+        font-size: 0.8125rem;
+        z-index: 60;
+        max-width: 90vw;
+      }
+      .toast[data-tone='error'] {
+        border-color: var(--color-danger);
+        color: var(--color-danger);
+      }
+      .job-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.625rem 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .job-row:last-child {
+        border-bottom: 0;
+      }
+      .dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 999px;
+        background: var(--faint);
+        flex: none;
+      }
+      .dot[data-on='true'] {
+        background: var(--color-success);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="topbar">
+        <h1 class="display">阿里云盘同步</h1>
+        <span class="status-line" id="status">加载中…</span>
+        <button class="btn btn-outline" id="scan-btn" type="button">立即扫描</button>
+        <button class="btn btn-outline" id="pause-btn" type="button">暂停</button>
+      </div>
+      <div class="tabs" id="tabs"></div>
+      <div class="scroll"><div class="page" id="page"></div></div>
+    </div>
+    <div id="overlay"></div>
+    <div id="toast-host"></div>
+
+    <script type="module">
+      const API = './api'
+      const TABS = [
+        ['sync', '同步'],
+        ['jobs', '任务'],
+        ['plan', '计划与限额'],
+        ['account', '账号'],
+      ]
+
+      // The cadence is lifted from tdrive's 传输 page so the two feel like one
+      // interface: a live snapshot's speed is stale after five seconds, a
+      // reload is coalesced to at most one per 1.2s, and an active transfer is
+      // polled every two seconds. A plugin route cannot stream events — the
+      // host buffers a whole response and caps a call at thirty seconds — so
+      // polling stands in for the core page's event subscription.
+      const LIVE_SPEED_TTL = 5000
+      const RELOAD_INTERVAL = 1200
+      const ACTIVE_POLL_INTERVAL = 2000
+      const IDLE_POLL_INTERVAL = 6000
+
+      const STATUS_LABEL = {
+        pending: '排队中',
+        running: '进行中',
+        complete: '已完成',
+        failed: '失败',
+        cancelled: '已取消',
+      }
+      const STAGE_LABEL = {
+        downloading: '下载中',
+        uploading: '上传中',
+        finishing: '收尾中',
+      }
+
+      const state = {
+        tab: localStorage.getItem('tdrive.aliyunpan.tab') || 'sync',
+        snapshot: null,
+        settings: null,
+        filters: new Set(),
+        jobFilter: '',
+        expanded: new Set(),
+        density: localStorage.getItem('tdrive.transferDensity') || 'compact',
+        loading: false,
+        lastLoad: 0,
+        editing: null,
+        picker: null,
+        planDirty: false,
+      }
+
+      // renderedTab and overlayKey stop the poll from repainting DOM that
+      // currently holds user input.
+      let renderedTab = ''
+      let overlayKey = ''
+
+      // ---------------------------------------------------------------- utils
+
+      function esc(value) {
+        return String(value ?? '').replace(
+          /[&<>"']/g,
+          (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+        )
+      }
+
+      function bytes(n) {
+        if (!n && n !== 0) return '—'
+        if (n < 1024) return n + ' B'
+        const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+        let value = n / 1024
+        let index = 0
+        while (value >= 1024 && index < units.length - 1) {
+          value /= 1024
+          index++
+        }
+        return value.toFixed(value >= 100 ? 0 : 1) + ' ' + units[index]
+      }
+
+      function rate(n) {
+        return n > 0 ? bytes(n) + '/s' : '—'
+      }
+
+      function clock(ms) {
+        if (!ms) return '—'
+        const date = new Date(ms)
+        return date.toLocaleString('zh-CN', { hour12: false })
+      }
+
+      function duration(ms) {
+        if (!ms || ms < 0) return '—'
+        const total = Math.round(ms / 1000)
+        if (total < 60) return total + ' 秒'
+        if (total < 3600) return Math.floor(total / 60) + ' 分 ' + (total % 60) + ' 秒'
+        return Math.floor(total / 3600) + ' 小时 ' + Math.floor((total % 3600) / 60) + ' 分'
+      }
+
+      function liveSpeed(row, now) {
+        if (!row.speedAt) return 0
+        return now - row.speedAt < LIVE_SPEED_TTL ? row.speed || 0 : 0
+      }
+
+      let toastTimer = null
+      function toast(message, tone) {
+        const host = document.getElementById('toast-host')
+        host.innerHTML =
+          '<div class="toast" data-tone="' + esc(tone || 'info') + '">' + esc(message) + '</div>'
+        clearTimeout(toastTimer)
+        toastTimer = setTimeout(() => (host.innerHTML = ''), 4000)
+      }
+
+      async function call(path, options) {
+        const response = await fetch(API + path, {
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          ...options,
+        })
+        const text = await response.text()
+        let payload = null
+        try {
+          payload = text ? JSON.parse(text) : null
+        } catch (error) {
+          throw new Error(text.slice(0, 300) || response.statusText)
+        }
+        if (!response.ok) throw new Error((payload && payload.error) || response.statusText)
+        return payload
+      }
+
+      // ---------------------------------------------------------------- load
+
+      let pollTimer = null
+
+      async function load(force) {
+        const now = Date.now()
+        if (!force && (state.loading || now - state.lastLoad < RELOAD_INTERVAL)) return
+        state.loading = true
+        try {
+          state.snapshot = await call('/state')
+          state.lastLoad = Date.now()
+          render()
+        } catch (error) {
+          document.getElementById('status').textContent = '读取状态失败：' + error.message
+        } finally {
+          state.loading = false
+        }
+        schedulePoll()
+      }
+
+      function schedulePoll() {
+        clearTimeout(pollTimer)
+        const snapshot = state.snapshot
+        const busy =
+          snapshot &&
+          (snapshot.summary.active > 0 ||
+            snapshot.scan.scanning ||
+            snapshot.installing ||
+            (snapshot.login && snapshot.login.active))
+        pollTimer = setTimeout(() => load(true), busy ? ACTIVE_POLL_INTERVAL : IDLE_POLL_INTERVAL)
+      }
+
+      async function act(path, options, message) {
+        try {
+          await call(path, { method: 'POST', ...(options || {}) })
+          if (message) toast(message, 'info')
+          await load(true)
+        } catch (error) {
+          toast(error.message, 'error')
+        }
+      }
+
+      // ---------------------------------------------------------------- views
+
+      function renderTabs() {
+        document.getElementById('tabs').innerHTML = TABS.map(
+          ([id, label]) =>
+            '<button class="tab" data-tab="' +
+            id +
+            '" data-active="' +
+            (state.tab === id) +
+            '">' +
+            label +
+            '</button>',
+        ).join('')
+      }
+
+      function render() {
+        renderTabs()
+        const snapshot = state.snapshot
+        if (!snapshot) return
+        document.getElementById('status').textContent = snapshot.status
+        const pause = document.getElementById('pause-btn')
+        pause.textContent = snapshot.paused ? '继续' : '暂停'
+        pause.dataset.paused = String(snapshot.paused)
+
+        const page = document.getElementById('page')
+        if (state.tab === 'plan') {
+          // The plan tab is a form. Repainting it on the poll interval would
+          // wipe whatever the administrator was halfway through typing, so it
+          // is drawn when the tab is entered and after a save, not on a timer.
+          if (renderedTab !== 'plan' || state.planDirty) {
+            page.innerHTML = planView(snapshot)
+            state.planDirty = false
+          }
+        } else if (state.tab === 'sync') {
+          page.innerHTML = syncView(snapshot)
+        } else if (state.tab === 'jobs') {
+          page.innerHTML = jobsView(snapshot)
+        } else {
+          page.innerHTML = accountView(snapshot)
+        }
+        renderedTab = state.tab
+        renderOverlay()
+      }
+
+      function syncView(snapshot) {
+        const now = Date.now()
+        const summary = snapshot.summary
+        const quota = snapshot.quota
+        const rows = snapshot.rows
+          .filter((row) => (state.filters.size === 0 ? true : state.filters.has(row.state)))
+          .filter((row) => (state.jobFilter ? row.jobId === state.jobFilter : true))
+          .slice()
+          .sort(sortRows)
+
+        const quotaPercent =
+          quota.dailyBytes > 0 ? Math.min(100, (quota.usedBytes / quota.dailyBytes) * 100) : 0
+
+        return [
+          '<div class="card">',
+          '<div class="stats">',
+          stat('进行中', String(summary.active)),
+          stat('排队中', String(summary.pending)),
+          stat('上传速度', rate(summary.uploadSpeed)),
+          stat('下载速度', rate(summary.downloadSpeed)),
+          stat('今日完成', summary.todayCount + ' 个 · ' + bytes(summary.todayBytes)),
+          stat(
+            '今日配额',
+            quota.dailyBytes > 0
+              ? bytes(quota.usedBytes) + ' / ' + bytes(quota.dailyBytes)
+              : bytes(quota.usedBytes) + '（不限）',
+          ),
+          '</div>',
+          quota.dailyBytes > 0
+            ? '<div style="margin-top:.75rem;height:6px;border-radius:999px;background:var(--sunk);overflow:hidden">' +
+              '<div style="height:100%;width:' +
+              quotaPercent.toFixed(1) +
+              '%;background:var(--color-clay)"></div></div>' +
+              '<div class="hint">配额在 ' +
+              esc(clock(quota.resetAt)) +
+              ' 重置，剩余 ' +
+              esc(bytes(quota.remaining)) +
+              '</div>'
+            : '',
+          quota.oversize
+            ? '<div class="warn-box" style="margin-top:.75rem">队列里有单个文件大于一整天的配额。这样的文件会在配额尚未使用的日子里单独放行，否则它会永远排不上队。</div>'
+            : '',
+          snapshot.scan.error
+            ? '<div class="error-box" style="margin-top:.75rem">扫描出错：' +
+              esc(snapshot.scan.error) +
+              '</div>'
+            : '',
+          '</div>',
+
+          '<div class="toolbar">',
+          ['pending', 'running', 'complete', 'failed', 'cancelled']
+            .map(
+              (key) =>
+                '<button class="filter" data-filter="' +
+                key +
+                '" data-active="' +
+                state.filters.has(key) +
+                '">' +
+                STATUS_LABEL[key] +
+                '</button>',
+            )
+            .join(''),
+          '<select class="input" id="job-filter" style="width:auto;padding:.3rem .5rem;font-size:.75rem">',
+          '<option value="">全部任务</option>',
+          (snapshot.jobs || [])
+            .map(
+              (job) =>
+                '<option value="' +
+                esc(job.id) +
+                '"' +
+                (state.jobFilter === job.id ? ' selected' : '') +
+                '>' +
+                esc(job.name) +
+                '</option>',
+            )
+            .join(''),
+          '</select>',
+          '<span class="grow"></span>',
+          '<button class="btn btn-ghost" id="density-btn" type="button">',
+          state.density === 'compact' ? '宽松' : '紧凑',
+          '</button>',
+          '<button class="btn btn-ghost" id="clear-btn" type="button">清空历史</button>',
+          '</div>',
+
+          '<div class="card" style="padding:0">',
+          rows.length === 0
+            ? '<div class="empty">没有符合条件的传输</div>'
+            : '<div class="rows" data-density="' +
+              state.density +
+              '">' +
+              rows.map((row) => transferRow(row, now)).join('') +
+              '</div>',
+          '</div>',
+          '<div class="hint">暂存目录 ' +
+            esc(snapshot.stageDir) +
+            '，上限 ' +
+            (snapshot.limits.stageLimit > 0 ? esc(bytes(snapshot.limits.stageLimit)) : '不限') +
+            '。</div>',
+        ].join('')
+      }
+
+      function sortRows(a, b) {
+        const rank = { running: 0, pending: 1, failed: 2, cancelled: 3, complete: 4 }
+        const delta = (rank[a.state] ?? 9) - (rank[b.state] ?? 9)
+        if (delta !== 0) return delta
+        return (b.finishedAt || b.startedAt || b.createdAt) - (a.finishedAt || a.startedAt || a.createdAt)
+      }
+
+      function stat(key, value) {
+        return '<div class="stat"><div class="k">' + esc(key) + '</div><div class="v">' + esc(value) + '</div></div>'
+      }
+
+      const ICONS = {
+        pending:
+          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+        running:
+          '<svg class="icon run" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></svg>',
+        complete:
+          '<svg class="icon ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m20 6-11 11-5-5"/></svg>',
+        failed:
+          '<svg class="icon bad" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>',
+        cancelled:
+          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6 18.4 18.4"/></svg>',
+      }
+
+      function transferRow(row, now) {
+        // The bar tracks whichever half is running: disk on the way in,
+        // Telegram on the way out. Mixing them into one number would make a
+        // finished download look like a half-finished upload.
+        const measured = row.stage === 'downloading' ? row.downloaded : row.done
+        const percent = row.total > 0 ? Math.min(100, (measured / row.total) * 100) : 0
+        const speed = liveSpeed(row, now)
+        const expanded = state.expanded.has(row.id)
+        const elapsed = row.finishedAt && row.startedAt ? row.finishedAt - row.startedAt : 0
+        const average = elapsed > 0 ? (row.total / elapsed) * 1000 : 0
+
+        return [
+          '<div class="trow" data-row="' + esc(row.id) + '">',
+          percent > 0 ? '<div class="fill" style="width:' + percent.toFixed(1) + '%"></div>' : '',
+          '<div class="body">',
+          ICONS[row.state] || ICONS.pending,
+          '<span class="name" title="' + esc(row.remotePath) + '">' + esc(row.name) + '</span>',
+          '<span class="chip">' + esc(row.jobName || '任务') + '</span>',
+          '<span class="meta">',
+          row.state === 'running'
+            ? esc((STAGE_LABEL[row.stage] || '进行中') + ' · ' + bytes(measured) + ' / ' + bytes(row.total)) +
+              (speed > 0 ? ' · ' + esc(rate(speed)) : '')
+            : esc(STATUS_LABEL[row.state] + ' · ' + bytes(row.total)),
+          '</span>',
+          row.state === 'failed'
+            ? '<button class="btn btn-ghost" data-retry="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">重试</button>'
+            : '',
+          row.state === 'pending'
+            ? '<button class="btn btn-ghost" data-cancel="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">取消</button>'
+            : '',
+          '</div>',
+          expanded
+            ? '<dl class="detail">' +
+              detail('云端路径', row.remotePath) +
+              detail('目标路径', row.targetPath) +
+              detail('状态', STATUS_LABEL[row.state] + (row.stage ? ' · ' + (STAGE_LABEL[row.stage] || '') : '')) +
+              detail('已下载', bytes(row.downloaded)) +
+              detail('已上传', bytes(row.done)) +
+              detail('开始', clock(row.startedAt)) +
+              detail('用时', duration(elapsed)) +
+              detail('平均速度', average > 0 ? rate(average) : '—') +
+              detail('尝试次数', String(row.attempts)) +
+              detail('创建', clock(row.createdAt)) +
+              (row.error ? detail('错误', row.error) : '') +
+              '</dl>'
+            : '',
+          '</div>',
+        ].join('')
+      }
+
+      function detail(key, value) {
+        return '<div><dt>' + esc(key) + '</dt><dd>' + esc(value) + '</dd></div>'
+      }
+
+      function jobsView(snapshot) {
+        const jobs = snapshot.jobs || []
+        return [
+          '<div class="card">',
+          '<div class="toolbar"><p class="section-title" style="margin:0">同步任务</p><span class="grow"></span>',
+          '<button class="btn btn-primary" id="new-job" type="button">新建任务</button></div>',
+          jobs.length === 0
+            ? '<div class="empty">还没有任务。新建一个，指定要同步的云盘目录和 tdrive 里的落点。</div>'
+            : jobs
+                .map(
+                  (job) =>
+                    '<div class="job-row">' +
+                    '<span class="dot" data-on="' + (job.enabled ? 'true' : 'false') + '"></span>' +
+                    '<div style="flex:1;min-width:0">' +
+                    '<div style="font-size:.875rem">' + esc(job.name) + '</div>' +
+                    '<div class="hint mono">' + esc(job.remotePath) + ' → ' + esc(job.targetPath) + '</div>' +
+                    '</div>' +
+                    (job.deleteAfterUpload
+                      ? '<span class="chip danger-text">上传后删除云端</span>'
+                      : '') +
+                    '<button class="btn btn-ghost" data-edit-job="' + esc(job.id) + '" type="button">编辑</button>' +
+                    '<button class="btn btn-danger" data-delete-job="' + esc(job.id) + '" type="button">删除</button>' +
+                    '</div>',
+                )
+                .join(''),
+          '</div>',
+        ].join('')
+      }
+
+      function planView(snapshot) {
+        const schedule = snapshot.schedule
+        const quota = snapshot.quota
+        const limits = snapshot.limits
+        return [
+          '<div class="card">',
+          '<p class="section-title">同步窗口</p>',
+          '<div class="form">',
+          '<div><label class="switch"><input type="checkbox" id="schedule-enabled"' +
+            (schedule.enabled ? ' checked' : '') +
+            '> 启用计划任务</label>',
+          '<div class="hint">关闭后不会开始任何新的传输。</div></div>',
+          field('窗口开始', '<input class="input" id="window-start" placeholder="01:00" value="' + esc(schedule.windowStart) + '">', '留空表示全天可跑'),
+          field('窗口结束', '<input class="input" id="window-end" placeholder="07:00" value="' + esc(schedule.windowEnd) + '">', '结束早于开始表示跨零点'),
+          field('扫描间隔（分钟）', '<input class="input" id="interval" type="number" min="1" max="1440" value="' + schedule.intervalMinutes + '">', '窗口内每隔这么久重新扫描一次云盘'),
+          '</div>',
+          '<div class="hint" style="margin-top:.5rem">当前' +
+            (schedule.open ? '在窗口内' : '不在窗口内') +
+            (schedule.nextOpenAt ? '，下次开启 ' + esc(clock(schedule.nextOpenAt)) : '') +
+            '。上次扫描 ' +
+            esc(clock(snapshot.scan.lastScanAt)) +
+            '。</div>',
+          '</div>',
+
+          '<div class="card">',
+          '<p class="section-title">每日配额</p>',
+          '<div class="form">',
+          field('每日上传上限（GiB）', '<input class="input" id="quota-gib" type="number" min="0" step="0.5" value="' + (quota.dailyBytes > 0 ? (quota.dailyBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示不限。只统计推送到 Telegram 的字节。'),
+          field('配额重置时刻', '<input class="input" id="quota-reset" placeholder="00:00" value="' + esc(currentResetAt()) + '">', '每天到点归零'),
+          '</div>',
+          '<div class="hint" style="margin-top:.5rem">当前周期 ' +
+            esc(quota.day) +
+            '，已用 ' +
+            esc(bytes(quota.usedBytes)) +
+            '，' +
+            esc(clock(quota.resetAt)) +
+            ' 重置。</div>',
+          '</div>',
+
+          '<div class="card">',
+          '<p class="section-title">暂存与归属</p>',
+          '<div class="form">',
+          field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage'),
+          field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 的暂存上限'),
+          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '传给 aliyunpan 的 max_download_rate'),
+          field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空使用第一个管理员" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归谁、占谁的配额'),
+          field('aliyunpan 路径', '<input class="input" id="binary-path" placeholder="留空使用插件下载的版本" value="' + esc((state.settings && state.settings.binaryPath) || '') + '">', '离线部署或自编译版本填这里'),
+          '</div>',
+          '</div>',
+
+          '<div class="toolbar"><span class="grow"></span><button class="btn btn-primary" id="save-plan" type="button">保存</button></div>',
+
+          '<div class="card">',
+          '<p class="section-title">tdrive 当前传输限制（同步会遵循这些参数）</p>',
+          '<div class="stats">',
+          stat('存储分片', bytes(limits.segmentSize)),
+          stat('上传分片', bytes(limits.uploadPartSize)),
+          stat('上传线程', String(limits.uploadThreads)),
+          stat('同时上传文件', String(limits.uploadConcurrency)),
+          stat('同时下载文件', String(limits.downloadConcurrency)),
+          stat('单文件下载连接', String(limits.maxDownloadConns)),
+          stat('调用间隔', limits.rateLimitMillis > 0 ? limits.rateLimitMillis + ' ms' : '不限'),
+          stat('tdrive 暂存上限', limits.cacheLimit > 0 ? bytes(limits.cacheLimit) : '不限'),
+          '</div>',
+          '<div class="hint" style="margin-top:.5rem">要改这些，去 tdrive 的「设置 → 性能参数 / 存储与暂存」。同步不会自己另设一套。</div>',
+          '</div>',
+        ].join('')
+      }
+
+      function currentResetAt() {
+        return (state.settings && state.settings.quota && state.settings.quota.resetAt) || '00:00'
+      }
+
+      function field(label, control, hint) {
+        return (
+          '<div><label class="label">' +
+          esc(label) +
+          '</label>' +
+          control +
+          (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') +
+          '</div>'
+        )
+      }
+
+      function accountView(snapshot) {
+        const binary = snapshot.binary
+        const account = snapshot.account
+        const login = snapshot.login
+        return [
+          '<div class="card">',
+          '<p class="section-title">aliyunpan 命令行</p>',
+          '<div class="stats">',
+          stat('状态', binary.installed ? '已安装' : '未安装'),
+          stat('版本', binary.version || '—'),
+          stat('来源', binary.managed ? '插件管理' : '自定义路径'),
+          '</div>',
+          '<div class="hint mono" style="margin-top:.5rem">' + esc(binary.path || '') + '</div>',
+          binary.error ? '<div class="error-box" style="margin-top:.5rem">' + esc(binary.error) + '</div>' : '',
+          snapshot.installError
+            ? '<div class="error-box" style="margin-top:.5rem">' + esc(snapshot.installError) + '</div>'
+            : '',
+          '<div class="toolbar" style="margin-top:.75rem">',
+          '<button class="btn btn-outline" id="install-btn" type="button"' +
+            (snapshot.installing || !binary.managed ? ' disabled' : '') +
+            '>' +
+            (snapshot.installing ? '正在下载…' : binary.installed ? '重新下载' : '下载 aliyunpan') +
+            '</button>',
+          binary.managed ? '' : '<span class="hint">配置里指定了自定义路径，插件不会覆盖它。</span>',
+          '</div>',
+          '</div>',
+
+          '<div class="card">',
+          '<p class="section-title">阿里云盘账号</p>',
+          account.loggedIn
+            ? '<div class="stats">' +
+              stat('昵称', account.nickname || '—') +
+              stat('UID', account.userId || '—') +
+              stat('网盘', account.driveName || '—') +
+              '</div>' +
+              '<div class="toolbar" style="margin-top:.75rem"><button class="btn btn-danger" id="logout-btn" type="button">退出登录</button>' +
+              '<button class="btn btn-ghost" id="refresh-account" type="button">刷新</button></div>'
+            : loginPanel(login, binary),
+          account.error ? '<div class="error-box" style="margin-top:.5rem">' + esc(account.error) + '</div>' : '',
+          '</div>',
+        ].join('')
+      }
+
+      function loginPanel(login, binary) {
+        if (!binary.installed) {
+          return '<div class="hint">先下载 aliyunpan，再进行扫码登录。</div>'
+        }
+        if (login && login.active && login.url) {
+          return [
+            '<div class="hint">在浏览器里打开下面的链接完成授权和扫码，然后回到这里点「我已完成登录」。链接 5 分钟内有效',
+            login.expiresAt ? '（' + esc(clock(new Date(login.expiresAt).getTime())) + ' 失效）' : '',
+            '。</div>',
+            '<div class="mono" style="margin:.5rem 0;padding:.5rem;background:var(--sunk);border-radius:var(--radius-control)">' +
+              esc(login.url) +
+              '</div>',
+            '<div class="toolbar">',
+            '<a class="btn btn-outline" href="' + esc(login.url) + '" target="_blank" rel="noopener noreferrer">打开链接</a>',
+            '<button class="btn btn-ghost" id="copy-login" type="button">复制链接</button>',
+            '<span class="grow"></span>',
+            '<button class="btn btn-ghost" id="cancel-login" type="button">取消</button>',
+            '<button class="btn btn-primary" id="confirm-login" type="button"' +
+              (login.phase === 'finishing' ? ' disabled' : '') +
+              '>' +
+              (login.phase === 'finishing' ? '正在换取令牌…' : '我已完成登录') +
+              '</button>',
+            '</div>',
+          ].join('')
+        }
+        return [
+          login && login.error ? '<div class="error-box" style="margin-bottom:.5rem">' + esc(login.error) + '</div>' : '',
+          '<div class="hint">还没有绑定阿里云盘账号。</div>',
+          '<div class="toolbar" style="margin-top:.75rem"><button class="btn btn-primary" id="start-login" type="button">扫码登录</button></div>',
+        ].join('')
+      }
+
+      // ------------------------------------------------------------- overlays
+
+      // renderOverlay repaints only when the overlay's identity changes. The
+      // job form lives in the DOM rather than in state until it is saved, so
+      // an unconditional repaint on every poll would discard half-typed input.
+      // The picker is checked first: it opens on top of the job form, and the
+      // form has to still be there underneath when the picker closes.
+      function renderOverlay(force) {
+        const overlay = document.getElementById('overlay')
+        const key = state.picker
+          ? ['picker', state.picker.kind, state.picker.path, state.picker.loading, state.picker.error].join('|')
+          : state.editing
+            ? 'job|' + (state.editing.id || 'new')
+            : ''
+        if (!force && key === overlayKey) return
+        overlayKey = key
+
+        if (state.picker) overlay.innerHTML = pickerModal(state.picker)
+        else if (state.editing) overlay.innerHTML = jobModal(state.editing)
+        else overlay.innerHTML = ''
+      }
+
+      function jobModal(job) {
+        return [
+          '<div class="modal-backdrop" data-close-modal="1"><div class="modal">',
+          '<h2>' + (job.id ? '编辑任务' : '新建任务') + '</h2>',
+          '<div class="form">',
+          field('名称', '<input class="input" id="job-name" value="' + esc(job.name || '') + '">'),
+          '<div><label class="switch"><input type="checkbox" id="job-enabled"' +
+            (job.enabled !== false ? ' checked' : '') +
+            '> 启用</label></div>',
+          '<div class="field-wide">' +
+            '<label class="label">云盘目录</label>' +
+            '<div class="toolbar"><input class="input" id="job-remote" value="' + esc(job.remotePath || '/') + '">' +
+            '<button class="btn btn-outline" data-pick="remote" type="button">浏览</button></div></div>',
+          '<div class="field-wide">' +
+            '<label class="label">tdrive 目标目录</label>' +
+            '<div class="toolbar"><input class="input" id="job-target" value="' + esc(job.targetPath || '/') + '">' +
+            '<button class="btn btn-outline" data-pick="target" type="button">浏览</button></div></div>',
+          field('最小文件（MiB）', '<input class="input" id="job-min" type="number" min="0" value="' + ((job.minSizeBytes || 0) / 1048576).toFixed(0) + '">', '0 表示不限'),
+          field('最大文件（MiB）', '<input class="input" id="job-max" type="number" min="0" value="' + ((job.maxSizeBytes || 0) / 1048576).toFixed(0) + '">', '0 表示不限'),
+          '<div class="field-wide">' +
+            field(
+              '排除规则',
+              '<input class="input" id="job-exclude" value="' + esc((job.excludeNames || []).join(', ')) + '">',
+              '按名称匹配的正则，多个用逗号分隔；匹配到的目录不会被进入',
+            ) +
+            '</div>',
+          '<div><label class="switch"><input type="checkbox" id="job-overwrite"' +
+            (job.overwrite ? ' checked' : '') +
+            '> 大小不同时覆盖 tdrive 里已有的同名文件</label></div>',
+          '<div><label class="switch"><input type="checkbox" id="job-delete"' +
+            (job.deleteAfterUpload ? ' checked' : '') +
+            '> <span class="danger-text">上传成功后删除云端原文件</span></label>',
+          '<div class="hint">只有在 tdrive 确认写入之后才会删除。这一步不可撤销。</div></div>',
+          '</div>',
+          '<div class="modal-actions">',
+          '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
+          '<button class="btn btn-primary" id="save-job" type="button">保存</button>',
+          '</div>',
+          '</div></div>',
+        ].join('')
+      }
+
+      function pickerModal(picker) {
+        return [
+          '<div class="modal-backdrop" data-close-modal="1"><div class="modal">',
+          '<h2>' + (picker.kind === 'remote' ? '选择云盘目录' : '选择 tdrive 目录') + '</h2>',
+          '<div class="mono" style="margin-bottom:.5rem">' + esc(picker.path) + '</div>',
+          picker.error ? '<div class="error-box">' + esc(picker.error) + '</div>' : '',
+          '<div class="picker">',
+          picker.path !== '/'
+            ? '<button data-picker-go="' + esc(parentOf(picker.path)) + '" type="button">.. 上一级</button>'
+            : '',
+          picker.loading
+            ? '<button type="button" disabled>加载中…</button>'
+            : (picker.entries || [])
+                .map(
+                  (entry) =>
+                    '<button data-picker-go="' + esc(entry.path) + '" type="button">📁 ' + esc(entry.name) + '</button>',
+                )
+                .join('') || '<button type="button" disabled>这里没有子目录</button>',
+          '</div>',
+          '<div class="modal-actions">',
+          '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
+          '<button class="btn btn-primary" id="picker-choose" type="button">选择当前目录</button>',
+          '</div>',
+          '</div></div>',
+        ].join('')
+      }
+
+      function parentOf(path) {
+        const trimmed = path.replace(/\/+$/, '')
+        const index = trimmed.lastIndexOf('/')
+        return index <= 0 ? '/' : trimmed.slice(0, index)
+      }
+
+      // --------------------------------------------------------------- events
+
+      document.addEventListener('click', async (event) => {
+        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
+        if (!target) return
+
+        if (target.dataset.tab) {
+          state.tab = target.dataset.tab
+          localStorage.setItem('tdrive.aliyunpan.tab', state.tab)
+          if (state.tab === 'plan') await loadSettings()
+          render()
+          return
+        }
+        if (target.dataset.filter) {
+          const key = target.dataset.filter
+          if (state.filters.has(key)) state.filters.delete(key)
+          else state.filters.add(key)
+          render()
+          return
+        }
+        if (target.dataset.retry) {
+          event.stopPropagation()
+          await act('/queue/retry?id=' + encodeURIComponent(target.dataset.retry), null, '已重新排队')
+          return
+        }
+        if (target.dataset.cancel) {
+          event.stopPropagation()
+          await act('/queue/cancel?id=' + encodeURIComponent(target.dataset.cancel), null, '已取消')
+          return
+        }
+        if (target.dataset.closeModal !== undefined) {
+          // A click inside the modal also finds the backdrop when walking up,
+          // so only the backdrop itself and the explicit cancel buttons close
+          // anything. The picker closes back onto the job form rather than
+          // dismissing both.
+          if (target.tagName === 'BUTTON' || event.target === target) {
+            if (state.picker) state.picker = null
+            else state.editing = null
+            renderOverlay(true)
+          }
+          return
+        }
+        if (target.dataset.pick) {
+          captureJobForm()
+          const kind = target.dataset.pick
+          openPicker(kind, kind === 'remote' ? state.editing.remotePath || '/' : state.editing.targetPath || '/')
+          return
+        }
+        if (target.dataset.pickerGo !== undefined) {
+          openPicker(state.picker.kind, target.dataset.pickerGo)
+          return
+        }
+        if (target.dataset.editJob) {
+          const job = (state.snapshot.jobs || []).find((item) => item.id === target.dataset.editJob)
+          state.editing = job ? { ...job } : null
+          renderOverlay(true)
+          return
+        }
+        if (target.dataset.deleteJob) {
+          const job = (state.snapshot.jobs || []).find((item) => item.id === target.dataset.deleteJob)
+          if (!window.confirm('删除任务「' + (job ? job.name : '') + '」？已完成的文件会留在 tdrive 里。')) return
+          try {
+            await call('/jobs?id=' + encodeURIComponent(target.dataset.deleteJob), { method: 'DELETE' })
+            toast('任务已删除')
+            await load(true)
+          } catch (error) {
+            toast(error.message, 'error')
+          }
+          return
+        }
+
+        switch (target.id) {
+          case 'scan-btn':
+            await act('/scan', null, '已开始扫描')
+            return
+          case 'pause-btn':
+            await act(target.dataset.paused === 'true' ? '/resume' : '/pause', null, null)
+            return
+          case 'density-btn':
+            state.density = state.density === 'compact' ? 'comfortable' : 'compact'
+            localStorage.setItem('tdrive.transferDensity', state.density)
+            render()
+            return
+          case 'clear-btn':
+            await act('/queue/clear', null, '历史已清空')
+            return
+          case 'new-job':
+            state.editing = { enabled: true, remotePath: '/', targetPath: '/阿里云盘' }
+            renderOverlay(true)
+            return
+          case 'save-job':
+            await saveJob()
+            return
+          case 'picker-choose':
+            applyPicker()
+            return
+          case 'save-plan':
+            await savePlan()
+            return
+          case 'install-btn':
+            await act('/binary/install', null, '开始下载 aliyunpan')
+            return
+          case 'start-login':
+            await act('/login/start', null, null)
+            return
+          case 'confirm-login':
+            await act('/login/confirm', null, null)
+            return
+          case 'cancel-login':
+            await act('/login/cancel', null, '已取消登录')
+            return
+          case 'copy-login':
+            try {
+              await navigator.clipboard.writeText(state.snapshot.login.url)
+              toast('链接已复制')
+            } catch (error) {
+              toast('复制失败，请手动选中链接', 'error')
+            }
+            return
+          case 'logout-btn':
+            if (!window.confirm('退出阿里云盘账号？同步会停止，直到重新登录。')) return
+            await act('/logout', null, '已退出')
+            return
+          case 'refresh-account':
+            await act('/account', { method: 'GET' }, null)
+            return
+        }
+
+        const row = target.closest('[data-row]')
+        if (row) {
+          const id = row.dataset.row
+          if (state.expanded.has(id)) state.expanded.delete(id)
+          else state.expanded.add(id)
+          render()
+        }
+      })
+
+      document.addEventListener('change', (event) => {
+        if (event.target.id === 'job-filter') {
+          state.jobFilter = event.target.value
+          render()
+        }
+      })
+
+      // ---------------------------------------------------------------- forms
+
+      async function loadSettings() {
+        try {
+          state.settings = await call('/settings')
+        } catch (error) {
+          toast(error.message, 'error')
+        }
+      }
+
+      function value(id) {
+        const element = document.getElementById(id)
+        return element ? element.value.trim() : ''
+      }
+
+      function checked(id) {
+        const element = document.getElementById(id)
+        return element ? element.checked : false
+      }
+
+      function captureJobForm() {
+        if (!state.editing) return
+        state.editing = {
+          ...state.editing,
+          name: value('job-name'),
+          enabled: checked('job-enabled'),
+          remotePath: value('job-remote'),
+          targetPath: value('job-target'),
+          minSizeBytes: Math.round(Number(value('job-min') || 0) * 1048576),
+          maxSizeBytes: Math.round(Number(value('job-max') || 0) * 1048576),
+          excludeNames: value('job-exclude')
+            .split(',')
+            .map((item) => item.trim())
+            .filter(Boolean),
+          overwrite: checked('job-overwrite'),
+          deleteAfterUpload: checked('job-delete'),
+        }
+      }
+
+      async function saveJob() {
+        captureJobForm()
+        const job = state.editing
+        if (job.deleteAfterUpload && !window.confirm('这个任务会在文件成功写入 tdrive 之后删除阿里云盘上的原文件。删除不可撤销，确定要开启吗？')) {
+          return
+        }
+        try {
+          await call('/jobs', { method: 'POST', body: JSON.stringify(job) })
+          state.editing = null
+          renderOverlay(true)
+          toast('任务已保存')
+          await load(true)
+        } catch (error) {
+          toast(error.message, 'error')
+        }
+      }
+
+      async function savePlan() {
+        await loadSettings()
+        if (!state.settings) return
+        const gib = Number(value('quota-gib') || 0)
+        const stageGib = Number(value('stage-limit') || 0)
+        const next = {
+          ...state.settings,
+          binaryPath: value('binary-path'),
+          stageDir: value('stage-dir'),
+          stageLimitBytes: Math.round(stageGib * 1073741824),
+          ownerUserId: value('owner'),
+          downloadRate: value('download-rate'),
+          schedule: {
+            ...state.settings.schedule,
+            enabled: checked('schedule-enabled'),
+            windowStart: value('window-start'),
+            windowEnd: value('window-end'),
+            intervalMinutes: Number(value('interval') || 15),
+          },
+          quota: {
+            dailyBytes: Math.round(gib * 1073741824),
+            resetAt: value('quota-reset') || '00:00',
+          },
+        }
+        try {
+          state.settings = await call('/settings', { method: 'PUT', body: JSON.stringify(next) })
+          state.planDirty = true
+          toast('已保存')
+          await load(true)
+        } catch (error) {
+          toast(error.message, 'error')
+        }
+      }
+
+      async function openPicker(kind, path) {
+        state.picker = { kind, path: path || '/', loading: true, entries: [], error: '' }
+        renderOverlay(true)
+        const endpoint = kind === 'remote' ? '/browse' : '/drive/browse'
+        try {
+          const result = await call(endpoint + '?path=' + encodeURIComponent(state.picker.path))
+          const entries = (result.entries || []).filter((entry) => entry.isDir)
+          state.picker = { ...state.picker, path: result.path, entries, loading: false }
+        } catch (error) {
+          state.picker = { ...state.picker, loading: false, error: error.message }
+        }
+        renderOverlay(true)
+      }
+
+      function applyPicker() {
+        if (!state.picker || !state.editing) return
+        if (state.picker.kind === 'remote') state.editing.remotePath = state.picker.path
+        else state.editing.targetPath = state.picker.path
+        state.picker = null
+        renderOverlay(true)
+      }
+
+      // Follow the main interface when the theme is changed in another tab.
+      window.addEventListener('storage', (event) => {
+        if (event.key !== 'tdrive.theme') return
+        const stored = localStorage.getItem('tdrive.theme')
+        const dark = stored ? stored === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches
+        document.documentElement.classList.toggle('dark', dark)
+      })
+
+      renderTabs()
+      if (state.tab === 'plan') loadSettings().then(() => load(true))
+      else load(true)
+    </script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "id": "aliyunpan",
+  "name": "阿里云盘同步",
+  "description": "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额。",
+  "version": "0.1.0",
+  "sdkVersion": "0.1",
+  "apiVersion": 1,
+  "author": "dibin",
+  "license": "MIT",
+  "repositoryUrl": "https://github.com/dibin666/tdrive-aliyunpan",
+  "documentationUrl": "https://github.com/dibin666/tdrive-aliyunpan/blob/main/README.md",
+  "entrypoint": "./cmd/tdrive-aliyunpan",
+  "capabilities": ["http"],
+  "routes": [
+    { "path": "/", "methods": ["GET"], "ui": true },
+    { "path": "/api/*", "methods": ["GET", "POST", "PUT", "DELETE"] }
+  ]
+}

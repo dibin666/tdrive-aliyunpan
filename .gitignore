@@ -1,0 +1,5 @@
+# Build output. vendor/ is deliberately NOT ignored: tdrive's plugin builder
+# compiles a fetched copy of this repository, where the local replace target
+# does not exist, so the dependencies have to travel with the source.
+/tdrive-aliyunpan
+*.test
