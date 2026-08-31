@@ -9,6 +9,16 @@
   "license": "MIT",
   "repositoryUrl": "https://github.com/dibin666/tdrive-aliyunpan",
   "documentationUrl": "https://github.com/dibin666/tdrive-aliyunpan/blob/main/README.md",
+  "artifacts": {
+    "linux/amd64": {
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-linux-amd64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "linux/arm64": {
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-linux-arm64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
   "entrypoint": "./cmd/tdrive-aliyunpan",
   "capabilities": ["http"],
   "routes": [

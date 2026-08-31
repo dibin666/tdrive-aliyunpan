@@ -1,0 +1,151 @@
+name: release
+
+# tdrive does not compile plugins. It downloads a release binary, checks it
+# against the SHA-256 in the published manifest, and only then executes it —
+# so building the artifacts and pinning their digests is this repository's job.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-plugin
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish plugin binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          # The host and the plugin have to agree on the SDK, so the toolchain
+          # follows the go directive rather than a version pinned here.
+          go-version-file: go.mod
+
+      - name: Vet and test
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./...
+
+      - name: Resolve release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version tdrive.plugin.json)"
+          tag="v$version"
+
+          # The manifest is the source of truth: the version it declares also
+          # names the release the artifact URLs point at.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match manifest version $version" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists. Bump version in tdrive.plugin.json" \
+              "and cmd/tdrive-aliyunpan/main.go to publish a new one." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile plugin binaries
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -buildvcs=false \
+              -o "dist/tdrive-aliyunpan-linux-$arch" ./cmd/tdrive-aliyunpan
+          done
+
+      - name: Pin the binaries in the published manifest
+        id: manifest
+        if: steps.version.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cp tdrive.plugin.json dist/tdrive.plugin.json
+
+          for arch in amd64 arm64; do
+            asset="tdrive-aliyunpan-linux-$arch"
+            expected="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$asset"
+            declared="$(jq -r --arg p "linux/$arch" '.artifacts[$p].url // ""' dist/tdrive.plugin.json)"
+            if [ "$declared" != "$expected" ]; then
+              echo "artifacts[\"linux/$arch\"].url is \"$declared\", expected \"$expected\"" >&2
+              exit 1
+            fi
+
+            # The committed manifest carries placeholder digests: a binary
+            # cannot contain its own hash, so the real values can only be
+            # computed once the binary exists.
+            digest="$(sha256sum "dist/$asset" | cut -d' ' -f1)"
+            jq --arg p "linux/$arch" --arg d "$digest" \
+              '.artifacts[$p].sha256 = $d' dist/tdrive.plugin.json > dist/manifest.tmp
+            mv dist/manifest.tmp dist/tdrive.plugin.json
+          done
+
+          echo "digest=$(sha256sum dist/tdrive.plugin.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          manifest_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/tdrive.plugin.json"
+
+          {
+            echo "在 tdrive「设置 → 插件 → 安装插件」粘贴这个清单地址："
+            echo
+            echo '```'
+            echo "$manifest_url"
+            echo '```'
+            echo
+            echo "清单 SHA-256（插件商店索引里的 \`manifestDigest\`）：\`$MANIFEST_DIGEST\`"
+            echo
+            echo "| 平台 | 二进制 SHA-256 |"
+            echo "|---|---|"
+            for arch in amd64 arm64; do
+              digest="$(jq -r --arg p "linux/$arch" '.artifacts[$p].sha256' dist/tdrive.plugin.json)"
+              echo "| linux/$arch | \`$digest\` |"
+            done
+          } > dist/notes.md
+
+          if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "$TAG" "$GITHUB_SHA" -m "Release $VERSION"
+            git push origin "$TAG"
+          fi
+
+          gh release create "$TAG" \
+            dist/tdrive-aliyunpan-linux-amd64 \
+            dist/tdrive-aliyunpan-linux-arm64 \
+            dist/tdrive.plugin.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$VERSION" \
+            --notes-file dist/notes.md
+
+          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"

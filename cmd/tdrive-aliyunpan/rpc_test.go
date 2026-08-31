@@ -104,12 +104,11 @@ func TestPluginServesOverRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
-	// The host refuses to start a plugin whose compiled manifest differs from
+	// The host refuses to start a plugin whose reported manifest differs from
 	// the installed JSON, comparing the two as marshalled JSON.
-	declared := readDeclaredManifest(t)
-	compiled, _ := json.Marshal(manifest)
-	installed, _ := json.Marshal(declared)
-	if string(compiled) != string(installed) {
+	compiled := installedManifestJSON(t, manifest)
+	installed := installedManifestJSON(t, readDeclaredManifest(t))
+	if compiled != installed {
 		t.Errorf("manifest mismatch:\nbinary: %s\nfile:   %s", compiled, installed)
 	}
 
@@ -171,17 +170,4 @@ func buildPlugin(t *testing.T) string {
 		t.Fatalf("build plugin: %v: %s", err, output)
 	}
 	return binary
-}
-
-func readDeclaredManifest(t *testing.T) tdriveplugin.Manifest {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", tdriveplugin.ManifestFile))
-	if err != nil {
-		t.Fatalf("read manifest: %v", err)
-	}
-	var manifest tdriveplugin.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("decode manifest: %v", err)
-	}
-	return manifest
 }

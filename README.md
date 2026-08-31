@@ -1,6 +1,6 @@
 # tdrive-aliyunpan
 
-把阿里云盘的文件按计划搬进 [tdrive](https://github.com/dibin/tdrive)（也就是搬进 Telegram）的插件。
+把阿里云盘的文件按计划搬进 [tdrive](https://github.com/dibin666/tdrive)（也就是搬进 Telegram）的插件。
 
 所有操作都在 tdrive 网页界面里完成：设置 → 插件 → 「阿里云盘同步」→ 打开。页面在当前标签页内展开，不会跳出去。
 
@@ -74,7 +74,26 @@
 
 ## 安装
 
-插件通过「设置 → 插件 → 源码安装」从 HTTPS 源码地址安装，由 tdrive 的构建边车编译。
+tdrive 不在服务器上编译插件，插件由这个仓库自己编译好发布，宿主只做「下载 → 校验 SHA-256 → 握手 → 启动」。在「设置 → 插件 → 安装插件」里粘贴 release 里那份清单的地址：
+
+```
+https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive.plugin.json
+```
+
+检查页会显示作者、许可证、目标平台和二进制 SHA-256，确认一次就装上。目前只发布 `linux/amd64` 和 `linux/arm64`；其它平台会在安装时直接报错并列出实际发布了哪些平台。
+
+## 构建和发布
+
+`.github/workflows/release.yml` 在推 `main`（或推 `v*` tag）时跑完整条流水线：`go vet` + `go test` → 交叉编译两个 Linux 二进制（`CGO_ENABLED=0 -trimpath -buildvcs=false`）→ 把算出来的摘要填进 `tdrive.plugin.json` → 打 tag，把两个二进制和填好的清单一起发成 release。release 说明里带着要粘贴的清单地址和它自己的 SHA-256（插件商店索引里的 `manifestDigest`）。
+
+版本号以 `tdrive.plugin.json` 的 `version` 为准，release 的 tag 就是 `v<version>`。发新版本要同时改两处，测试盯着它们一致：
+
+- `tdrive.plugin.json` 的 `version`，以及 `artifacts[*].url` 里的 tag；
+- `cmd/tdrive-aliyunpan/main.go` 里 `Manifest()` 的 `Version`。
+
+宿主会把插件自报的 manifest 和装上去的 JSON 逐字段比对，对不上就拒绝启动，所以这两份必须一致。版本没动时工作流照样跑测试，但发现 release 已存在就不再发布。
+
+仓库里 `artifacts[*].sha256` 是全 0 占位值 —— 二进制不可能包含自己的哈希，填进去就再也算不出不动点。真实摘要只存在于 release 里那份清单。`artifacts` 也只写在 JSON 里，不进 Go 代码：宿主比对 manifest 时会跳过这个字段。
 
 仓库里提交了 `vendor/`：构建机上拿不到 `../tdrive`，vendor 模式下所有依赖都来自仓库内，不需要 `github.com/dibin/tdrive` 发布到公共 proxy。
 
@@ -89,7 +108,7 @@ Works/
 ```sh
 go build ./...
 go test ./...
-go mod vendor        # 改过依赖之后要重新生成
+go mod vendor        # 改过依赖、或 tdrive 的 pkg/plugin 动过之后要重新生成
 ```
 
 ## 依赖 tdrive 的两处改动
