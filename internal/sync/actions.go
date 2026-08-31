@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
 )
 
@@ -32,6 +33,13 @@ func (e *Engine) InstallBinary(ctx context.Context) error {
 	if stopping {
 		return errors.New("插件正在停止")
 	}
+	// #region DEBUG H2/H4 installation request
+	debuglog.Write("H4", "internal/sync/actions.go:34", "binary installation requested", map[string]any{
+		"binaryPath": cli.Binary(),
+		"managed":    cli.Managed(),
+		"stopping":   stopping,
+	})
+	// #endregion
 
 	e.probeMu.Lock()
 	if e.installing {
@@ -56,6 +64,13 @@ func (e *Engine) InstallBinary(ctx context.Context) error {
 	go func() {
 		defer e.workers.Done()
 		err := cli.InstallManaged(background)
+		// #region DEBUG H2/H4 installation completed
+		debuglog.Write("H2", "internal/sync/actions.go:66", "binary installation completed", map[string]any{
+			"binaryPath": cli.Binary(),
+			"success":    err == nil,
+			"installing": true,
+		})
+		// #endregion
 
 		e.probeMu.Lock()
 		e.installing = false

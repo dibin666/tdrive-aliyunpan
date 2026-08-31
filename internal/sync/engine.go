@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
 )
@@ -175,6 +176,15 @@ func (e *Engine) Load(ctx context.Context) error {
 		e.queue = append(e.queue, item)
 	}
 	e.cli = aliyunpan.New(e.aliyunpanDir(), stored.BinaryPath)
+	// #region DEBUG H1/H5 engine load path
+	debuglog.Write("H1", "internal/sync/engine.go:175", "engine loaded persisted CLI path", map[string]any{
+		"dataDir":            e.dataDir,
+		"aliyunpanDir":       e.aliyunpanDir(),
+		"storedBinaryPath":   stored.BinaryPath,
+		"resolvedBinaryPath": e.cli.Binary(),
+		"managed":            e.cli.Managed(),
+	})
+	// #endregion
 	e.dirty = false
 	e.quotaDirty = false
 	e.queueRevision = 0
@@ -238,8 +248,9 @@ func (e *Engine) SaveSettings(ctx context.Context, next settings.Settings) error
 func (e *Engine) applySettings(next settings.Settings) {
 	e.mu.Lock()
 	oldJobs := e.settings.Jobs
+	oldBinaryPath := e.settings.BinaryPath
 	changedJobs := !reflect.DeepEqual(oldJobs, next.Jobs)
-	rebuild := e.cli == nil || e.settings.BinaryPath != next.BinaryPath
+	rebuild := e.cli == nil || oldBinaryPath != next.BinaryPath
 	previousCLI := e.cli
 	e.settings = next
 	if rebuild {
@@ -262,6 +273,16 @@ func (e *Engine) applySettings(next settings.Settings) {
 		}
 	}
 	e.mu.Unlock()
+	if rebuild || oldBinaryPath != next.BinaryPath {
+		// #region DEBUG H5 settings-driven CLI rebuild
+		debuglog.Write("H5", "internal/sync/engine.go:228", "settings changed CLI path or instance", map[string]any{
+			"oldBinaryPath": oldBinaryPath,
+			"newBinaryPath": next.BinaryPath,
+			"cliRebuilt":    rebuild,
+			"previousCLI":   previousCLI != nil,
+		})
+		// #endregion
+	}
 	if rebuild && previousCLI != nil {
 		// A path change invalidates an in-flight login/download on the old CLI;
 		// otherwise it can keep the old config or executable busy while the new

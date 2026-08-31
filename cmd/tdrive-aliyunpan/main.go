@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 	syncengine "github.com/dibin/tdrive-aliyunpan/internal/sync"
 	"github.com/dibin/tdrive-aliyunpan/internal/webui"
@@ -76,7 +77,24 @@ func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
 	client := hostapi.New(host)
 	storageDir := dataDir()
 	legacyDir := legacyDataDir()
+	// #region DEBUG H1/H4 data-directory selection
+	debuglog.Write("H1", "cmd/tdrive-aliyunpan/main.go:77", "plugin data directories resolved", map[string]any{
+		"storageDir":           storageDir,
+		"legacyDir":            legacyDir,
+		"configuredDataDirSet": strings.TrimSpace(os.Getenv(pluginDataDirEnv)) != "",
+		"storageBinaryPresent": hasManagedBinary(storageDir),
+		"legacyBinaryPresent":  hasManagedBinary(legacyDir),
+	})
+	// #endregion
 	if err := migrateLegacyDataDir(storageDir, legacyDir); err != nil {
+		// #region DEBUG H1 migration failure
+		debuglog.Write("H1", "cmd/tdrive-aliyunpan/main.go:88", "legacy data migration failed", map[string]any{
+			"storageDir":           storageDir,
+			"legacyDir":            legacyDir,
+			"storageBinaryPresent": hasManagedBinary(storageDir),
+			"legacyBinaryPresent":  hasManagedBinary(legacyDir),
+		})
+		// #endregion
 		// The host's plugin-data directory is the canonical location. Migration
 		// is best effort so an old, otherwise healthy installation still gets a
 		// usable config page if a filesystem policy prevents moving a leftover.
@@ -86,6 +104,12 @@ func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
 			// forcing a multi-megabyte re-download. It will be retried on the
 			// next start after the filesystem becomes writable.
 			storageDir = legacyDir
+			// #region DEBUG H1 legacy directory fallback
+			debuglog.Write("H1", "cmd/tdrive-aliyunpan/main.go:101", "using legacy data directory fallback", map[string]any{
+				"storageDir": storageDir,
+				"legacyDir":  legacyDir,
+			})
+			// #endregion
 			p.logger.Printf("改用旧 aliyunpan 数据目录以保留已有二进制: %s", storageDir)
 		}
 	}
@@ -93,6 +117,15 @@ func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
 	if err := p.engine.Load(ctx); err != nil {
 		return err
 	}
+	// #region DEBUG H1/H5 engine CLI configuration
+	if cli := p.engine.CLI(); cli != nil {
+		debuglog.Write("H5", "cmd/tdrive-aliyunpan/main.go:116", "engine loaded CLI configuration", map[string]any{
+			"storageDir": storageDir,
+			"binaryPath": cli.Binary(),
+			"managed":    cli.Managed(),
+		})
+	}
+	// #endregion
 	p.web = webui.New(p.engine, client)
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))

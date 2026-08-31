@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 )
 
 // CLI is a configured aliyunpan installation.
@@ -56,6 +58,15 @@ func New(dataDir, override string) *CLI {
 		binary = override
 		managed = false
 	}
+	// #region DEBUG H1/H5 CLI path construction
+	debuglog.Write("H1", "internal/aliyunpan/cli.go:54", "CLI path constructed", map[string]any{
+		"dataDir":     dataDir,
+		"overrideSet": override != "",
+		"binaryPath":  binary,
+		"managed":     managed,
+		"configDir":   filepath.Join(dataDir, "config"),
+	})
+	// #endregion
 	return &CLI{
 		binary:      binary,
 		configDir:   filepath.Join(dataDir, "config"),

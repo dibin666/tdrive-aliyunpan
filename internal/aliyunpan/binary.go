@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 )
 
 // ReleaseVersion is the aliyunpan release this plugin installs and was tested
@@ -102,6 +104,18 @@ func Install(ctx context.Context, destination string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	installationSucceeded := false
+	archiveBytes := int64(0)
+	defer func() {
+		// #region DEBUG H2 binary installation outcome
+		debuglog.Write("H2", "internal/aliyunpan/binary.go:103", "binary installation outcome", map[string]any{
+			"destination":          destination,
+			"success":              installationSucceeded,
+			"archiveBytes":         archiveBytes,
+			"destinationPresent":   filePresent(destination),
+		})
+		// #endregion
+	}()
 	url, err := DownloadURL()
 	if err != nil {
 		return err
@@ -136,6 +150,7 @@ func Install(ctx context.Context, destination string) error {
 		_ = os.Remove(archive.Name())
 	}()
 	size, err := io.Copy(archive, io.LimitReader(response.Body, maxArchiveBytes+1))
+	archiveBytes = size
 	if err != nil {
 		return fmt.Errorf("下载 aliyunpan: %w", err)
 	}
@@ -152,7 +167,11 @@ func Install(ctx context.Context, destination string) error {
 		if path.Base(entry.Name) != wanted || entry.FileInfo().IsDir() {
 			continue
 		}
-		return extractTo(entry, destination)
+		err := extractTo(entry, destination)
+		if err == nil {
+			installationSucceeded = true
+		}
+		return err
 	}
 	return fmt.Errorf("压缩包里没有找到 %s", wanted)
 }
@@ -242,6 +261,17 @@ type BinaryState struct {
 func (c *CLI) Probe(ctx context.Context) BinaryState {
 	state := BinaryState{Path: c.binary, Managed: c.managed}
 	info, err := os.Stat(c.binary)
+	// #region DEBUG H2 binary filesystem probe
+	debuglog.Write("H2", "internal/aliyunpan/binary.go:207", "binary filesystem probe completed", map[string]any{
+		"binaryPath":  c.binary,
+		"managed":     c.managed,
+		"statOK":      err == nil,
+		"notFound":    os.IsNotExist(err),
+		"isDirectory": err == nil && info.IsDir(),
+		"size":        binarySize(info),
+		"mode":        binaryMode(info),
+	})
+	// #endregion
 	if err != nil || info.IsDir() {
 		return state
 	}
@@ -249,8 +279,43 @@ func (c *CLI) Probe(ctx context.Context) BinaryState {
 	output, err := c.runCommand(ctx, runOptions{timeout: 30 * time.Second}, "--version")
 	if err != nil {
 		state.Error = err.Error()
+		// #region DEBUG H2 binary execution probe
+		debuglog.Write("H2", "internal/aliyunpan/binary.go:222", "binary exists but version probe failed", map[string]any{
+			"binaryPath":  c.binary,
+			"managed":     c.managed,
+			"installed":   state.Installed,
+			"versionRead": false,
+		})
+		// #endregion
 		return state
 	}
 	state.Version = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(output), "aliyunpan version"))
+	// #region DEBUG H2 binary execution probe succeeded
+	debuglog.Write("H2", "internal/aliyunpan/binary.go:233", "binary version probe succeeded", map[string]any{
+		"binaryPath":  c.binary,
+		"managed":     c.managed,
+		"installed":   state.Installed,
+		"versionRead": state.Version != "",
+	})
+	// #endregion
 	return state
+}
+
+func binarySize(info os.FileInfo) int64 {
+	if info == nil {
+		return -1
+	}
+	return info.Size()
+}
+
+func binaryMode(info os.FileInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.Mode().String()
+}
+
+func filePresent(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }

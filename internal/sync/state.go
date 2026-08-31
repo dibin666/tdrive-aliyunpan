@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
+	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
 )
 
@@ -222,6 +223,17 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 	e.probeMu.Lock()
 	installing, installError := e.installing, e.installError
 	e.probeMu.Unlock()
+	// #region DEBUG H3 state response probe snapshot
+	debuglog.Write("H3", "internal/sync/state.go:240", "state response assembled from probe cache", map[string]any{
+		"binaryPath":        binary.Path,
+		"binaryManaged":     binary.Managed,
+		"binaryInstalled":   binary.Installed,
+		"binaryVersionRead": binary.Version != "",
+		"accountLoggedIn":   account.LoggedIn,
+		"installing":        installing,
+		"installError":      installError != "",
+	})
+	// #endregion
 	snapshot := Snapshot{
 		Rows:    rows,
 		Summary: summary,
@@ -348,6 +360,18 @@ func (e *Engine) probe(ctx context.Context) (AccountView, aliyunpan.BinaryState)
 		e.probes.refreshing = true
 	}
 	e.probeMu.Unlock()
+	// #region DEBUG H3 probe cache decision
+	debuglog.Write("H3", "internal/sync/state.go:331", "probe cache decision", map[string]any{
+		"cold":             cold,
+		"stale":            stale,
+		"refreshing":       cache.refreshing,
+		"startRefresh":     shouldRefresh,
+		"cachedBinaryPath": cache.binary.Path,
+		"cachedInstalled":  cache.binary.Installed,
+		"cachedChecked":    !cache.checkedAt.IsZero(),
+		"cachedLoggedIn":   cache.account.LoggedIn,
+	})
+	// #endregion
 
 	if shouldRefresh {
 		// Detached from the request: the poll that noticed the staleness must
@@ -377,6 +401,15 @@ func (e *Engine) RefreshProbe(_ context.Context) (AccountView, aliyunpan.BinaryS
 	e.requestProbeRefresh()
 	e.probeMu.Lock()
 	defer e.probeMu.Unlock()
+	// #region DEBUG H3 explicit refresh return value
+	debuglog.Write("H3", "internal/sync/state.go:368", "explicit refresh returned current cache", map[string]any{
+		"binaryPath": e.probes.binary.Path,
+		"installed":  e.probes.binary.Installed,
+		"checked":    !e.probes.checkedAt.IsZero(),
+		"refreshing": e.probes.refreshing,
+		"loggedIn":   e.probes.account.LoggedIn,
+	})
+	// #endregion
 	return e.probes.account, e.probes.binary
 }
 
@@ -384,11 +417,21 @@ func (e *Engine) requestProbeRefresh() {
 	e.probeMu.Lock()
 	if e.probes.refreshing {
 		e.probes.rerun = true
+		// #region DEBUG H3 probe refresh coalesced
+		debuglog.Write("H3", "internal/sync/state.go:381", "probe refresh coalesced behind active probe", map[string]any{
+			"rerun": true,
+		})
+		// #endregion
 		e.probeMu.Unlock()
 		return
 	}
 	e.probes.refreshing = true
 	e.probeMu.Unlock()
+	// #region DEBUG H3 probe refresh launched
+	debuglog.Write("H3", "internal/sync/state.go:390", "probe refresh requested", map[string]any{
+		"backgroundContext": true,
+	})
+	// #endregion
 	if !e.launchProbe(e.backgroundContext()) {
 		e.probeMu.Lock()
 		e.probes.refreshing = false
@@ -402,11 +445,19 @@ func (e *Engine) launchProbe(ctx context.Context) bool {
 	}
 	e.mu.Lock()
 	if e.stopping {
+		// #region DEBUG H3 probe launch rejected
+		debuglog.Write("H3", "internal/sync/state.go:404", "probe launch rejected while stopping", map[string]any{
+			"stopping": true,
+		})
+		// #endregion
 		e.mu.Unlock()
 		return false
 	}
 	e.workers.Add(1)
 	e.mu.Unlock()
+	// #region DEBUG H3 probe goroutine launched
+	debuglog.Write("H3", "internal/sync/state.go:414", "probe goroutine launched", map[string]any{})
+	// #endregion
 	go func() {
 		defer e.workers.Done()
 		e.refreshProbe(ctx)
@@ -427,15 +478,39 @@ func (e *Engine) refreshProbe(ctx context.Context) {
 	e.probeMu.Lock()
 	revision := e.probes.revision
 	e.probeMu.Unlock()
+	cli := e.CLI()
+	// #region DEBUG H1/H3 probe started
+	debuglog.Write("H1", "internal/sync/state.go:426", "probe started with CLI instance", map[string]any{
+		"revision":   revision,
+		"cliPresent": cli != nil,
+		"binaryPath": func() string {
+			if cli == nil {
+				return ""
+			}
+			return cli.Binary()
+		}(),
+		"managed": func() bool {
+			return cli != nil && cli.Managed()
+		}(),
+	})
+	// #endregion
 	probeCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	cli := e.CLI()
 	var (
 		account AccountView
 		binary  aliyunpan.BinaryState
 	)
 	if cli != nil {
 		binary = cli.Probe(probeCtx)
+		// #region DEBUG H2/H3 probe binary result
+		debuglog.Write("H2", "internal/sync/state.go:449", "probe received binary result", map[string]any{
+			"binaryPath":   binary.Path,
+			"managed":      binary.Managed,
+			"installed":    binary.Installed,
+			"versionRead":  binary.Version != "",
+			"errorPresent": binary.Error != "",
+		})
+		// #endregion
 		if binary.Installed {
 			resolved, err := cli.Who(probeCtx)
 			switch {
@@ -468,6 +543,16 @@ func (e *Engine) refreshProbe(ctx context.Context) {
 
 	e.probeMu.Lock()
 	stale := e.probes.revision != revision || e.probes.rerun
+	// #region DEBUG H3 probe cache write decision
+	debuglog.Write("H3", "internal/sync/state.go:494", "probe completed and cache write evaluated", map[string]any{
+		"revisionAtStart": revision,
+		"revisionNow":     e.probes.revision,
+		"rerun":           e.probes.rerun,
+		"stale":           stale,
+		"binaryInstalled": binary.Installed,
+		"accountLoggedIn": account.LoggedIn,
+	})
+	// #endregion
 	if !stale {
 		e.probes.account = account
 		e.probes.binary = binary
@@ -476,6 +561,14 @@ func (e *Engine) refreshProbe(ctx context.Context) {
 	e.probes.refreshing = false
 	e.probes.rerun = false
 	e.probeMu.Unlock()
+	// #region DEBUG H3 probe cache write completed
+	debuglog.Write("H3", "internal/sync/state.go:510", "probe cache write completed", map[string]any{
+		"saved":       !stale,
+		"nextRefresh": stale,
+		"installed":   binary.Installed,
+		"loggedIn":    account.LoggedIn,
+	})
+	// #endregion
 	if stale {
 		// A logout/login or an explicit refresh happened while this command was
 		// in flight. The old result is discarded and exactly one fresh probe is
