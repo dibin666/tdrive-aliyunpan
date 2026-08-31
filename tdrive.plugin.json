@@ -17,6 +17,14 @@
     "linux/arm64": {
       "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-linux-arm64",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "windows/amd64": {
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-windows-amd64.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "windows/arm64": {
+      "url": "https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive-aliyunpan-windows-arm64.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   },
   "entrypoint": "./cmd/tdrive-aliyunpan",

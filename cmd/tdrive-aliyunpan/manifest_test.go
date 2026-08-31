@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +13,16 @@ import (
 // The manifest spells out one absolute URL per platform, so the two have to
 // agree or tdrive downloads nothing.
 const releaseDownloadPrefix = "https://github.com/dibin666/tdrive-aliyunpan/releases/download/"
+
+// publishedPlatforms is what .github/workflows/release.yml builds. tdrive
+// itself ships Linux and Windows, and the plugin is pure Go, so it follows the
+// host onto every platform the host runs on.
+var publishedPlatforms = [][2]string{
+	{"linux", "amd64"},
+	{"linux", "arm64"},
+	{"windows", "amd64"},
+	{"windows", "arm64"},
+}
 
 // tdrive reads tdrive.plugin.json when it inspects and installs a plugin, but
 // the running process reports Manifest() over RPC. The manager compares the
@@ -46,7 +55,13 @@ func TestPublishedManifestDeclaresArtifacts(t *testing.T) {
 	if err := manifest.ValidatePublished(); err != nil {
 		t.Fatalf("ValidatePublished: %v", err)
 	}
-	for _, platform := range [][2]string{{"linux", "amd64"}, {"linux", "arm64"}} {
+	// A platform the manifest declares but the workflow does not build would
+	// publish a URL pointing at an asset that was never uploaded.
+	if len(manifest.Artifacts) != len(publishedPlatforms) {
+		t.Errorf("manifest declares %d platforms, the release workflow builds %d",
+			len(manifest.Artifacts), len(publishedPlatforms))
+	}
+	for _, platform := range publishedPlatforms {
 		goos, goarch := platform[0], platform[1]
 		artifact, err := manifest.ArtifactFor(goos, goarch)
 		if err != nil {
@@ -56,11 +71,26 @@ func TestPublishedManifestDeclaresArtifacts(t *testing.T) {
 		// The release workflow fills in the digests but takes the URLs as
 		// given, so a version bump that forgets them would publish a manifest
 		// pointing at the previous release.
-		want := fmt.Sprintf("%sv%s/tdrive-aliyunpan-%s-%s", releaseDownloadPrefix, manifest.Version, goos, goarch)
+		want := releaseDownloadPrefix + "v" + manifest.Version + "/" + releaseAssetName(goos, goarch)
 		if artifact.URL != want {
 			t.Errorf("%s/%s url = %s, want %s", goos, goarch, artifact.URL, want)
 		}
 	}
+}
+
+// releaseAssetName mirrors the naming in .github/workflows/release.yml.
+//
+// The .exe suffix is not cosmetic. os/exec resolves an absolute path through
+// findExecutable, which only stats the path as given when it already has an
+// extension; for an extension-less path it tries each PATHEXT suffix instead
+// and never looks at the bare file. tdrive therefore stores the installed
+// binary as <id>.exe on Windows, and the asset is named to match.
+func releaseAssetName(goos, goarch string) string {
+	name := "tdrive-aliyunpan-" + goos + "-" + goarch
+	if goos == "windows" {
+		return name + ".exe"
+	}
+	return name
 }
 
 // The plugin serves a page and a JSON API below it. Losing either route

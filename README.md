@@ -80,11 +80,13 @@ tdrive 不在服务器上编译插件，插件由这个仓库自己编译好发�
 https://github.com/dibin666/tdrive-aliyunpan/releases/download/v0.1.0/tdrive.plugin.json
 ```
 
-检查页会显示作者、许可证、目标平台和二进制 SHA-256，确认一次就装上。目前只发布 `linux/amd64` 和 `linux/arm64`；其它平台会在安装时直接报错并列出实际发布了哪些平台。
+检查页会显示作者、许可证、目标平台和二进制 SHA-256，确认一次就装上。发布的平台是 `linux/amd64`、`linux/arm64`、`windows/amd64`、`windows/arm64` —— tdrive 主程序自己发哪几个平台，插件就跟到哪几个。tdrive 只找和自己 `GOOS/GOARCH` 完全一致的那一项，对不上会在安装时直接报错并列出实际发布了哪些平台。
 
 ## 构建和发布
 
-`.github/workflows/release.yml` 在推 `main`（或推 `v*` tag）时跑完整条流水线：`go vet` + `go test` → 交叉编译两个 Linux 二进制（`CGO_ENABLED=0 -trimpath -buildvcs=false`）→ 把算出来的摘要填进 `tdrive.plugin.json` → 打 tag，把两个二进制和填好的清单一起发成 release。release 说明里带着要粘贴的清单地址和它自己的 SHA-256（插件商店索引里的 `manifestDigest`）。
+`.github/workflows/release.yml` 在推 `main`（或推 `v*` tag）时跑完整条流水线：`go vet`（另外单跑一遍 `GOOS=windows go vet`，因为 Windows 那两个二进制是交叉编译出来的，CI 里跑不到）+ `go test` → 交叉编译四个平台（`CGO_ENABLED=0 -trimpath -buildvcs=false`）→ 把算出来的摘要填进 `tdrive.plugin.json` → 打 tag，把四个二进制和填好的清单一起发成 release。release 说明里带着要粘贴的清单地址和它自己的 SHA-256（插件商店索引里的 `manifestDigest`）。
+
+Windows 的资产名带 `.exe`，这不是习惯问题：Go 的 `os/exec` 解析绝对路径时，对没有扩展名的路径根本不会去 stat 它本身，只会试路径加上各个 `PATHEXT` 后缀，所以少了后缀会在 `CreateProcess` 之前就以 `ErrNotFound` 失败。tdrive 也因此把装好的二进制存成 `<插件目录>/<id>.exe`。
 
 版本号以 `tdrive.plugin.json` 的 `version` 为准，release 的 tag 就是 `v<version>`。发新版本要同时改两处，测试盯着它们一致：
 
@@ -120,7 +122,7 @@ go mod vendor        # 改过依赖、或 tdrive 的 pkg/plugin 动过之后要�
 
 ## aliyunpan 命令行
 
-默认装在 `<插件数据目录>/aliyunpan/bin/aliyunpan`，版本固定为 `v0.4.0`（输出格式是被解析的，不能随版本漂移）。它是静态链接的 Go 二进制，distroless 镜像里可以直接 exec。
+默认装在 `<插件数据目录>/aliyunpan/bin/aliyunpan`（Windows 上是 `aliyunpan.exe`），版本固定为 `v0.4.0`（输出格式是被解析的，不能随版本漂移）。上游按平台发压缩包，插件只从里面取出可执行文件那一个成员，`linux/amd64`、`linux/arm64`、`windows/amd64`、`windows/arm64` 都有对应的资产。它是静态链接的 Go 二进制，distroless 镜像里可以直接 exec。
 
 所有调用都带 `ALIYUNPAN_CONFIG_DIR=<插件数据目录>/aliyunpan/config`，和宿主机上任何已有的 aliyunpan 配置互不干扰。
 

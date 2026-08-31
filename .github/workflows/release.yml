@@ -36,6 +36,10 @@ jobs:
         run: |
           set -euo pipefail
           go vet ./...
+          # The Windows build is cross-compiled and never executed here, so vet
+          # is the only thing standing between a GOOS-specific mistake and a
+          # published artifact that cannot start.
+          GOOS=windows go vet ./...
           go test ./...
 
       - name: Resolve release version
@@ -64,32 +68,36 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Cross-compile plugin binaries
-        if: steps.version.outputs.publish == 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-              go build -trimpath -buildvcs=false \
-              -o "dist/tdrive-aliyunpan-linux-$arch" ./cmd/tdrive-aliyunpan
-          done
-
-      - name: Pin the binaries in the published manifest
+      - name: Build the binaries and pin them in the published manifest
         id: manifest
         if: steps.version.outputs.publish == 'true'
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
+          mkdir -p dist
           cp tdrive.plugin.json dist/tdrive.plugin.json
 
-          for arch in amd64 arm64; do
-            asset="tdrive-aliyunpan-linux-$arch"
+          # tdrive publishes Linux and Windows builds, and the plugin follows it
+          # onto both. On Windows the .exe suffix is load-bearing: os/exec will
+          # not start an extension-less absolute path, so tdrive stores the
+          # installed binary as <id>.exe and the asset is named to match.
+          for platform in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            goos="${platform%/*}"
+            goarch="${platform#*/}"
+            asset="tdrive-aliyunpan-$goos-$goarch"
+            if [ "$goos" = windows ]; then
+              asset="$asset.exe"
+            fi
+
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -buildvcs=false \
+              -o "dist/$asset" ./cmd/tdrive-aliyunpan
+
             expected="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$asset"
-            declared="$(jq -r --arg p "linux/$arch" '.artifacts[$p].url // ""' dist/tdrive.plugin.json)"
+            declared="$(jq -r --arg p "$platform" '.artifacts[$p].url // ""' dist/tdrive.plugin.json)"
             if [ "$declared" != "$expected" ]; then
-              echo "artifacts[\"linux/$arch\"].url is \"$declared\", expected \"$expected\"" >&2
+              echo "artifacts[\"$platform\"].url is \"$declared\", expected \"$expected\"" >&2
               exit 1
             fi
 
@@ -97,7 +105,7 @@ jobs:
             # cannot contain its own hash, so the real values can only be
             # computed once the binary exists.
             digest="$(sha256sum "dist/$asset" | cut -d' ' -f1)"
-            jq --arg p "linux/$arch" --arg d "$digest" \
+            jq --arg p "$platform" --arg d "$digest" \
               '.artifacts[$p].sha256 = $d' dist/tdrive.plugin.json > dist/manifest.tmp
             mv dist/manifest.tmp dist/tdrive.plugin.json
           done
@@ -113,6 +121,7 @@ jobs:
           MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
           manifest_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/tdrive.plugin.json"
 
           {
@@ -126,11 +135,11 @@ jobs:
             echo
             echo "| 平台 | 二进制 SHA-256 |"
             echo "|---|---|"
-            for arch in amd64 arm64; do
-              digest="$(jq -r --arg p "linux/$arch" '.artifacts[$p].sha256' dist/tdrive.plugin.json)"
-              echo "| linux/$arch | \`$digest\` |"
-            done
-          } > dist/notes.md
+            # Read the table back out of the manifest, so it can only describe
+            # what was actually published.
+            jq -r '.artifacts | to_entries | sort_by(.key)[]
+              | "| \(.key) | `\(.value.sha256)` |"' dist/tdrive.plugin.json
+          } > "$notes"
 
           if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
             git config user.name 'github-actions[bot]'
@@ -139,13 +148,10 @@ jobs:
             git push origin "$TAG"
           fi
 
-          gh release create "$TAG" \
-            dist/tdrive-aliyunpan-linux-amd64 \
-            dist/tdrive-aliyunpan-linux-arm64 \
-            dist/tdrive.plugin.json \
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$VERSION" \
-            --notes-file dist/notes.md
+            --notes-file "$notes"
 
-          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
