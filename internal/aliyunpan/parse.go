@@ -122,6 +122,9 @@ func parseRow(parent, leading, modified, name string) (Entry, error) {
 		if err != nil {
 			return Entry{}, fmt.Errorf("无法解析文件大小 %q: %w", raw, err)
 		}
+		if size < 0 {
+			return Entry{}, fmt.Errorf("文件大小不能为负数: %d", size)
+		}
 		entry.Size = size
 	}
 	if hash := fields[len(fields)-2]; sha1Pattern.MatchString(hash) {

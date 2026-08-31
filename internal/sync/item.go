@@ -5,6 +5,7 @@ package sync
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strconv"
 	"time"
 )
 
@@ -34,9 +35,10 @@ const (
 
 // Item is one file on its way from Aliyun Drive into tdrive.
 type Item struct {
-	ID      string `json:"id"`
-	JobID   string `json:"jobId"`
-	JobName string `json:"jobName"`
+	ID        string `json:"id"`
+	JobID     string `json:"jobId"`
+	JobName   string `json:"jobName"`
+	DriveName string `json:"driveName,omitempty"`
 
 	RemotePath string `json:"remotePath"`
 	TargetDir  string `json:"targetDir"`
@@ -95,7 +97,11 @@ func (i *Item) Finished() bool {
 // key identifies the same cloud file across scans. The content hash is part of
 // it so that replacing a cloud file with a different one under the same name
 // queues the new version instead of being mistaken for the old.
-func (i *Item) key() string { return i.JobID + "\x00" + i.RemotePath + "\x00" + i.SHA1 }
+func (i *Item) key() string {
+	// Size is part of the fallback identity when an upstream file has no SHA1;
+	// otherwise a changed file can stay pending under the old size forever.
+	return i.JobID + "\x00" + i.RemotePath + "\x00" + i.SHA1 + "\x00" + strconv.FormatInt(i.Size, 10)
+}
 
 // speedSampleWindow is how long a sample is accumulated before it becomes the
 // reported rate. Shorter than this and the number flickers; longer and it lags

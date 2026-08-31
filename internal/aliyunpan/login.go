@@ -68,6 +68,11 @@ type LoginSession struct {
 	command *exec.Cmd
 	cancel  context.CancelFunc
 	done    chan struct{}
+	waitErr <-chan error
+	release func()
+	// releaseOnce prevents an error path and the output reader from releasing
+	// the shared CLI command slot twice.
+	releaseOnce sync.Once
 	// confirmOnce keeps a double-clicked "已完成登录" from writing twice into
 	// a child that only reads one line.
 	confirmOnce sync.Once
@@ -77,12 +82,32 @@ type LoginSession struct {
 // A previous unfinished session is discarded, which is what a user pressing
 // "重新开始" expects.
 func (c *CLI) StartLogin(ctx context.Context) (LoginState, error) {
-	c.loginMu.Lock()
-	defer c.loginMu.Unlock()
-
-	if c.login != nil {
-		c.login.abort()
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	c.loginStartMu.Lock()
+	defer c.loginStartMu.Unlock()
+
+	c.loginMu.Lock()
+	previous := c.login
+	c.login = nil
+	c.loginMu.Unlock()
+	if previous != nil {
+		previous.abort()
+	}
+	loginStartCtx, cancelStart := context.WithCancel(ctx)
+	defer cancelStart()
+	unregister := c.registerRunning(cancelStart)
+	defer unregister()
+	if err := c.acquireCommand(loginStartCtx); err != nil {
+		return LoginState{}, err
+	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			c.releaseCommand()
+		}
+	}()
 	if err := os.MkdirAll(c.configDir, 0o750); err != nil {
 		return LoginState{}, fmt.Errorf("创建 aliyunpan 配置目录: %w", err)
 	}
@@ -99,16 +124,21 @@ func (c *CLI) StartLogin(ctx context.Context) (LoginState, error) {
 		cancel()
 		return LoginState{}, err
 	}
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		cancel()
-		return LoginState{}, err
-	}
-	command.Stderr = command.Stdout
+	stdout, output := io.Pipe()
+	command.Stdout = output
+	command.Stderr = output
 	if err := command.Start(); err != nil {
 		cancel()
+		_ = stdout.Close()
+		_ = output.Close()
 		return LoginState{}, fmt.Errorf("启动 aliyunpan login: %w", err)
 	}
+	waitErr := make(chan error, 1)
+	go func() {
+		err := command.Wait()
+		_ = output.Close()
+		waitErr <- err
+	}()
 
 	session := &LoginSession{
 		phase:   LoginStarting,
@@ -117,17 +147,27 @@ func (c *CLI) StartLogin(ctx context.Context) (LoginState, error) {
 		command: command,
 		cancel:  cancel,
 		done:    make(chan struct{}),
+		waitErr: waitErr,
+		release: c.releaseCommand,
 	}
 	urlReady := make(chan struct{})
-	go session.consume(stdout, urlReady)
+	c.loginMu.Lock()
 	c.login = session
+	c.loginMu.Unlock()
+	go session.consume(stdout, urlReady)
+	releaseOnError = false
 
+	timer := time.NewTimer(25 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-urlReady:
 	case <-session.done:
-	case <-time.After(90 * time.Second):
+	case <-timer.C:
 		session.abort()
-		return LoginState{}, errors.New("aliyunpan 没有在 90 秒内返回授权链接")
+		return LoginState{}, errors.New("aliyunpan 没有在 25 秒内返回授权链接")
+	case <-loginStartCtx.Done():
+		session.abort()
+		return LoginState{}, loginStartCtx.Err()
 	}
 	state := session.State()
 	if state.URL == "" {
@@ -148,6 +188,7 @@ func (c *CLI) StartLogin(ctx context.Context) (LoginState, error) {
 func (s *LoginSession) consume(stdout io.ReadCloser, urlReady chan struct{}) {
 	defer close(s.done)
 	defer s.cancel()
+	defer s.releaseCommand()
 
 	var transcript strings.Builder
 	announced := false
@@ -168,14 +209,27 @@ func (s *LoginSession) consume(stdout io.ReadCloser, urlReady chan struct{}) {
 			}
 		}
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.cancel()
+				_ = s.stdin.Close()
+			}
 			break
 		}
 		if transcript.Len() > 256<<10 {
+			s.cancel()
+			_ = s.stdin.Close()
 			break
 		}
 	}
 	_ = stdout.Close()
-	waitErr := s.command.Wait()
+	var waitErr error
+	if s.waitErr != nil {
+		waitErr = <-s.waitErr
+	} else {
+		// Keep manually constructed LoginSession values usable in package tests
+		// and by older callers that did not provide the wait channel.
+		waitErr = s.command.Wait()
+	}
 	if !announced {
 		close(urlReady)
 	}
@@ -219,6 +273,9 @@ func (s *LoginSession) Confirm() error {
 
 // Wait blocks until the session ends or ctx is done.
 func (s *LoginSession) Wait(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	select {
 	case <-s.done:
 	case <-ctx.Done():
@@ -229,6 +286,14 @@ func (s *LoginSession) abort() {
 	s.cancel()
 	_ = s.stdin.Close()
 	<-s.done
+}
+
+func (s *LoginSession) releaseCommand() {
+	s.releaseOnce.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
 }
 
 func (s *LoginSession) set(mutate func()) {
@@ -264,6 +329,9 @@ func (c *CLI) LoginState() LoginState {
 
 // ConfirmLogin completes the browser step of the running session.
 func (c *CLI) ConfirmLogin(ctx context.Context) (LoginState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.loginMu.Lock()
 	session := c.login
 	c.loginMu.Unlock()

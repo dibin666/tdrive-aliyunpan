@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,7 +26,14 @@ const (
 	resendRounds = 3
 	// uploadSource labels these transfers on tdrive's own 传输 page.
 	uploadSource = "aliyunpan"
+	// stageItemsDir separates simultaneous jobs. Two jobs can legitimately read
+	// the same cloud path from different drives or write it to different target
+	// directories; sharing a path under one staging root would let one download
+	// delete or overwrite the other one's source while it is uploading.
+	stageItemsDir = ".tdrive-aliyunpan-items"
 )
+
+var ErrStageRoom = errors.New("暂存空间不足")
 
 // missingSegmentsPattern reads drive.Complete's refusal, which formats the
 // pending indices with %v: "upload is still missing segments [3 7]".
@@ -33,32 +41,84 @@ var missingSegmentsPattern = regexp.MustCompile(`missing segments \[([0-9 ]*)\]`
 
 // transfer runs one item end to end: stage it on disk, push it to Telegram,
 // commit, then clean up.
-func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.RuntimeSettings) {
+func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.RuntimeSettings) bool {
 	defer e.releaseReservation(item.Size)
 
 	staged, err := e.stage(ctx, item, limits)
 	if err != nil {
+		if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
+			e.invalidateProbe()
+			e.requestProbeRefresh()
+			e.deferUntilLogin(ctx, item)
+			return false
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			e.deferUntilRetry(ctx, item, err)
+			return false
+		}
+		if errors.Is(err, ErrStageRoom) {
+			e.deferUntilRetry(ctx, item, err)
+			return false
+		}
 		e.fail(ctx, item, err)
-		return
+		return true
 	}
 	// The staged copy is disk the drive is not managing, so it is removed on
 	// every exit path, successful or not.
-	defer func() { _ = os.Remove(staged) }()
+	defer func() { cleanupStaged(staged, item.ID) }()
 
 	if err := e.upload(ctx, item, staged, limits); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			e.deferUntilRetry(ctx, item, err)
+			return false
+		}
 		e.fail(ctx, item, err)
-		return
+		return true
 	}
 	if item.DeleteAfter {
 		// Only reached after the drive has committed the file, so the cloud
 		// copy is never the last one standing.
 		if cli := e.CLI(); cli != nil {
-			if err := cli.Remove(ctx, item.RemotePath); err != nil {
+			drive, resolveErr := cli.ResolveDrive(ctx, item.DriveName)
+			if resolveErr != nil {
+				e.logger.Printf("解析删除目标网盘失败: %v", resolveErr)
+			} else if err := cli.Remove(ctx, item.RemotePath, drive.ID); err != nil {
 				e.logger.Printf("删除云端 %s 失败: %v", item.RemotePath, err)
 			}
 		}
 	}
 	e.complete(ctx, item)
+	return true
+}
+
+func (e *Engine) deferUntilLogin(ctx context.Context, item *Item) {
+	e.mu.Lock()
+	item.State = StatePending
+	item.Stage = StageIdle
+	item.Downloaded = 0
+	item.Uploaded = 0
+	item.UploadJobID = ""
+	item.Error = "等待重新登录阿里云盘"
+	item.FinishedAt = 0
+	item.resetSpeed()
+	e.markQueueDirtyLocked()
+	e.mu.Unlock()
+	e.persistNow(ctx)
+}
+
+func (e *Engine) deferUntilRetry(ctx context.Context, item *Item, err error) {
+	e.mu.Lock()
+	item.State = StatePending
+	item.Stage = StageIdle
+	item.Downloaded = 0
+	item.Uploaded = 0
+	item.UploadJobID = ""
+	item.Error = err.Error()
+	item.FinishedAt = 0
+	item.resetSpeed()
+	e.markQueueDirtyLocked()
+	e.mu.Unlock()
+	e.persistNow(ctx)
 }
 
 // stage downloads the cloud file onto local disk.
@@ -68,7 +128,14 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 		return "", errors.New("aliyunpan 尚未配置")
 	}
 	stageDir := e.StageDir()
-	if err := e.checkStageRoom(item, stageDir, limits); err != nil {
+	releaseStage, err := e.reserveStageRoom(item.Size, stageDir, limits)
+	if err != nil {
+		return "", err
+	}
+	defer releaseStage()
+	downloadDir := itemStageDir(stageDir, item.ID)
+	drive, err := cli.ResolveDrive(ctx, item.DriveName)
+	if err != nil {
 		return "", err
 	}
 
@@ -86,32 +153,43 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 	}
 	staged, err := cli.Download(ctx, aliyunpan.DownloadRequest{
 		CloudPath:     item.RemotePath,
-		StageDir:      stageDir,
+		StageDir:      downloadDir,
+		DriveID:       drive.ID,
 		SliceParallel: slices,
 	}, item.Size, func(done int64) { e.noteDownload(item, done) })
 	if err != nil {
+		_ = os.RemoveAll(downloadDir)
 		return "", err
 	}
+	// The completed file is now visible to stagedBytesAt, so the reservation
+	// must be released before the next worker evaluates the disk limit.
+	releaseStage()
 	return staged, nil
 }
 
-// checkStageRoom refuses to start a download that would blow the staging
-// budget, unless the staging area is empty — in which case refusing would mean
-// the file can never be synced at all.
-func (e *Engine) checkStageRoom(item *Item, stageDir string, limits hostapi.RuntimeSettings) error {
-	limit := e.stageLimit(limits)
-	if limit <= 0 {
-		return nil
+func itemStageDir(stageDir, itemID string) string {
+	if itemID == "" {
+		itemID = "anonymous"
 	}
-	used := e.stagedBytes()
-	if used+item.Size <= limit {
-		return nil
+	return filepath.Join(stageDir, stageItemsDir, itemID)
+}
+
+// cleanupStaged removes only the private directory allocated to one queue
+// item. It intentionally does not remove the administrator's stage root or
+// another item's files.
+func cleanupStaged(staged, itemID string) {
+	_ = os.Remove(staged)
+	dir := filepath.Dir(staged)
+	if itemID == "" {
+		itemID = "anonymous"
 	}
-	if used == 0 {
-		return nil
+	for dir != filepath.Dir(dir) {
+		if filepath.Base(dir) == itemID && filepath.Base(filepath.Dir(dir)) == stageItemsDir {
+			_ = os.RemoveAll(dir)
+			return
+		}
+		dir = filepath.Dir(dir)
 	}
-	return fmt.Errorf("暂存空间不足：已占用 %d 字节，上限 %d 字节，本文件 %d 字节；等待其它文件完成后重试",
-		used, limit, item.Size)
 }
 
 // upload pushes the staged file into the drive, one segment at a time.
@@ -184,6 +262,19 @@ func (e *Engine) sendSegments(
 	job tdriveplugin.UploadJob,
 	indices []int,
 ) error {
+	if item.Size == 0 {
+		// tdrive represents an empty file with a caption-only record. It still
+		// needs a zero-byte PutSegment call to create that record; skipping the
+		// segment would leave CompleteUpload permanently reporting segment 1 as
+		// missing.
+		for _, index := range indices {
+			if index != 1 {
+				continue
+			}
+			return e.host.PutSegment(ctx, job.ID, index, 0, strings.NewReader(""), nil)
+		}
+		return nil
+	}
 	for _, index := range indices {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -216,19 +307,16 @@ func (e *Engine) sendSegments(
 func (e *Engine) chargeQuotaDelta(ctx context.Context, item *Item, delta int64) {
 	e.mu.Lock()
 	item.Uploaded += delta
-	item.observe(delta, time.Now())
-	e.quota.UsedBytes += delta
-	due := time.Since(e.lastPersist) >= persistInterval
-	quota := e.quota
-	e.dirty = true
-	if due {
-		e.lastPersist = time.Now()
+	if item.Size >= 0 && item.Uploaded > item.Size {
+		// A missing segment may be resent. Progress is the committed file
+		// geometry, not the sum of every attempted byte written to a stream.
+		item.Uploaded = item.Size
 	}
+	item.observe(delta, time.Now())
+	due := time.Since(e.lastPersist) >= persistInterval
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	if due {
-		if err := e.host.SetData(ctx, quotaKey, quota); err != nil {
-			e.logger.Printf("保存配额计数失败: %v", err)
-		}
 		e.persistNow(ctx)
 	}
 }
@@ -289,12 +377,21 @@ func parseMissingSegments(err error) []int {
 // abort tears down a failed upload so the storage channel is not left holding
 // documents nothing points at.
 func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason string) {
-	if err := e.host.AbortUpload(ctx, jobID, reason, "failed"); err != nil {
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	if err := e.host.AbortUpload(cleanupCtx, jobID, reason, "failed"); err != nil {
 		e.logger.Printf("放弃上传 %s 失败: %v", item.Name, err)
 	}
 	e.mu.Lock()
 	item.UploadJobID = ""
 	e.mu.Unlock()
+}
+
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return withTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }
 
 // uploadOwner resolves the account uploads are attributed to. The owner

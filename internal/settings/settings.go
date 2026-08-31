@@ -9,6 +9,7 @@ package settings
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -61,9 +62,12 @@ type Quota struct {
 
 // Job is one cloud directory mirrored into one drive directory.
 type Job struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Enabled    bool   `json:"enabled"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// DriveName selects the Aliyun Drive namespace independently for each job.
+	// The CLI's active drive is process-global, so jobs must not rely on it.
+	DriveName  string `json:"driveName"`
 	RemotePath string `json:"remotePath"`
 	TargetPath string `json:"targetPath"`
 	// ExcludeNames are Go regular expressions matched against each entry's
@@ -87,6 +91,7 @@ const (
 	minIntervalMinutes   = 1
 	maxIntervalMinutes   = 24 * 60
 	maxExcludePatternLen = 512
+	DefaultDriveName     = "backup"
 )
 
 // Default is the document a fresh installation starts from. The schedule is
@@ -110,12 +115,18 @@ var (
 // from the core's textarea gets the same treatment as the plugin's own forms.
 func (s *Settings) Normalize() error {
 	s.BinaryPath = strings.TrimSpace(s.BinaryPath)
-	if s.BinaryPath != "" && !strings.HasPrefix(s.BinaryPath, "/") {
+	if s.BinaryPath != "" && !filepath.IsAbs(s.BinaryPath) {
 		return errors.New("binaryPath 必须是绝对路径")
 	}
+	if err := checkPathText("binaryPath", s.BinaryPath); err != nil {
+		return err
+	}
 	s.StageDir = strings.TrimSpace(s.StageDir)
-	if s.StageDir != "" && !strings.HasPrefix(s.StageDir, "/") {
+	if s.StageDir != "" && !filepath.IsAbs(s.StageDir) {
 		return errors.New("stageDir 必须是绝对路径")
+	}
+	if err := checkPathText("stageDir", s.StageDir); err != nil {
+		return err
 	}
 	if s.StageLimitBytes < 0 {
 		return errors.New("stageLimitBytes 不能为负数")
@@ -171,13 +182,32 @@ func (j *Job) normalize() error {
 	if j.Name == "" {
 		j.Name = j.ID
 	}
+	driveName := strings.TrimSpace(j.DriveName)
+	if driveName == "" {
+		j.DriveName = DefaultDriveName
+	} else {
+		switch strings.ToLower(driveName) {
+		case "backup", "file", "备份盘", "文件":
+			j.DriveName = "backup"
+		case "resource", "资源盘", "资源库":
+			j.DriveName = "resource"
+		default:
+			return fmt.Errorf("任务 %s 的网盘不支持 %q，只能是 backup（备份盘）或 resource（资源库）", j.Name, j.DriveName)
+		}
+	}
 	j.RemotePath = CleanCloudPath(j.RemotePath)
 	if j.RemotePath == "" {
 		return fmt.Errorf("任务 %s 缺少云盘路径", j.Name)
 	}
+	if err := checkPathText("云盘路径", j.RemotePath); err != nil {
+		return fmt.Errorf("任务 %s: %w", j.Name, err)
+	}
 	j.TargetPath = CleanCloudPath(j.TargetPath)
 	if j.TargetPath == "" {
 		return fmt.Errorf("任务 %s 缺少 tdrive 目标路径", j.Name)
+	}
+	if err := checkPathText("tdrive 目标路径", j.TargetPath); err != nil {
+		return fmt.Errorf("任务 %s: %w", j.Name, err)
 	}
 	if j.MinSizeBytes < 0 || j.MaxSizeBytes < 0 {
 		return fmt.Errorf("任务 %s 的大小过滤不能为负数", j.Name)
@@ -226,6 +256,13 @@ func CleanCloudPath(path string) string {
 		cleaned = append(cleaned, part)
 	}
 	return "/" + strings.Join(cleaned, "/")
+}
+
+func checkPathText(label, value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("%s 不能含有 NUL 或换行字符", label)
+	}
+	return nil
 }
 
 func checkClock(label, value string) error {
@@ -295,14 +332,22 @@ func (s Schedule) NextOpen(now time.Time) time.Time {
 // 6th; naming it by its start date is what makes the stored counter comparable
 // across restarts.
 func (q Quota) Day(now time.Time) string {
+	return q.PeriodStart(now).Format("2006-01-02")
+}
+
+// PeriodStart returns the beginning of the current quota period. It is also
+// used for the UI's "today" totals, which must follow a custom reset time
+// rather than a rolling 24-hour window.
+func (q Quota) PeriodStart(now time.Time) time.Time {
 	reset := minutesOfDay(q.ResetAt)
 	if reset < 0 {
 		reset = 0
 	}
-	if now.Hour()*60+now.Minute() < reset {
-		now = now.AddDate(0, 0, -1)
+	start := time.Date(now.Year(), now.Month(), now.Day(), reset/60, reset%60, 0, 0, now.Location())
+	if now.Before(start) {
+		start = start.AddDate(0, 0, -1)
 	}
-	return now.Format("2006-01-02")
+	return start
 }
 
 // NextReset is when the current quota period ends.

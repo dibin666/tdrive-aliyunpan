@@ -28,17 +28,22 @@ type CLI struct {
 	// opposed to an operator-supplied path.
 	managed bool
 
-	// mu serializes the short commands. aliyunpan keeps its tokens in a config
-	// file it rewrites on almost every command (Before: ReloadConfigFunc,
-	// After: SaveConfigFunc), so two concurrent invocations can lose a
-	// refreshed token.
-	mu sync.Mutex
-	// downloadMu serializes downloads separately; see Download for why they do
-	// not share the lock above.
-	downloadMu sync.Mutex
+	// commandGate serializes every aliyunpan process, including downloads. The
+	// CLI rewrites its config file after almost every command, so allowing a
+	// concurrent `ll` or `who` to run beside a download can lose a refreshed
+	// token or the selected drive.
+	commandGate     chan struct{}
+	commandGateInit sync.Once
+	runningMu       sync.Mutex
+	running         map[uint64]context.CancelFunc
+	nextRunID       uint64
+
 	// loginMu guards the interactive login session.
 	loginMu sync.Mutex
-	login   *LoginSession
+	// loginStartMu prevents two callers from replacing each other's login while
+	// still allowing CancelLogin to acquire loginMu during the URL wait.
+	loginStartMu sync.Mutex
+	login        *LoginSession
 }
 
 // New builds a CLI. When override is empty the managed binary under dataDir is
@@ -51,7 +56,13 @@ func New(dataDir, override string) *CLI {
 		binary = override
 		managed = false
 	}
-	return &CLI{binary: binary, configDir: filepath.Join(dataDir, "config"), managed: managed}
+	return &CLI{
+		binary:      binary,
+		configDir:   filepath.Join(dataDir, "config"),
+		managed:     managed,
+		commandGate: make(chan struct{}, 1),
+		running:     make(map[uint64]context.CancelFunc),
+	}
 }
 
 // Binary is the resolved executable path.
@@ -65,7 +76,21 @@ func (c *CLI) InstallManaged(ctx context.Context) error {
 	if !c.managed {
 		return errors.New("配置里指定了自定义 aliyunpan 路径，插件不会覆盖它")
 	}
-	return Install(ctx, c.binary)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Installing replaces the executable. Keep it behind the same gate as
+	// probes, login and transfers so no command can be using a half-replaced
+	// file (and so Windows is not asked to replace a running executable).
+	installCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	unregister := c.registerRunning(cancel)
+	defer unregister()
+	if err := c.acquireCommand(installCtx); err != nil {
+		return err
+	}
+	defer c.releaseCommand()
+	return Install(installCtx, c.binary)
 }
 
 type runOptions struct {
@@ -75,14 +100,94 @@ type runOptions struct {
 	stdin string
 }
 
+func (c *CLI) initCommandGate() {
+	c.commandGateInit.Do(func() {
+		if c.commandGate == nil {
+			c.commandGate = make(chan struct{}, 1)
+		}
+		if c.running == nil {
+			c.running = make(map[uint64]context.CancelFunc)
+		}
+	})
+}
+
+func (c *CLI) acquireCommand(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.initCommandGate()
+	select {
+	case c.commandGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *CLI) releaseCommand() {
+	<-c.commandGate
+}
+
+func (c *CLI) runCommand(ctx context.Context, options runOptions, args ...string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Register before waiting for the shared slot. Otherwise a queued download
+	// is invisible to Logout and can jump in front of the logout command after
+	// the currently running download is cancelled.
+	commandCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	unregister := c.registerRunning(cancel)
+	defer unregister()
+	if err := c.acquireCommand(commandCtx); err != nil {
+		return "", err
+	}
+	defer c.releaseCommand()
+	return c.run(commandCtx, options, args...)
+}
+
+func (c *CLI) registerRunning(cancel context.CancelFunc) func() {
+	c.initCommandGate()
+	c.runningMu.Lock()
+	c.nextRunID++
+	id := c.nextRunID
+	c.running[id] = cancel
+	c.runningMu.Unlock()
+	return func() {
+		c.runningMu.Lock()
+		delete(c.running, id)
+		c.runningMu.Unlock()
+	}
+}
+
+// CancelRunning interrupts a download or another non-interactive command so a
+// logout can complete instead of waiting behind a multi-hour transfer.
+func (c *CLI) CancelRunning() {
+	c.runningMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(c.running))
+	for _, cancel := range c.running {
+		cancels = append(cancels, cancel)
+	}
+	c.runningMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // run executes one aliyunpan command and returns its combined output.
 //
 // aliyunpan reports most failures on stdout with a zero exit status ("未登录
 // 账号" is the common one), so callers must inspect the text; a non-zero exit
 // is treated as an error only because it is unambiguous when it happens.
 func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if options.timeout <= 0 {
 		options.timeout = 2 * time.Minute
+	}
+	if len(args) == 0 {
+		return "", errors.New("aliyunpan 命令不能为空")
 	}
 	if err := os.MkdirAll(c.configDir, 0o750); err != nil {
 		return "", fmt.Errorf("创建 aliyunpan 配置目录: %w", err)
@@ -106,6 +211,9 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 	err := command.Run()
 	text := output.String()
 	if runCtx.Err() != nil {
+		if errors.Is(runCtx.Err(), context.Canceled) {
+			return text, fmt.Errorf("aliyunpan %s 已取消: %w", args[0], context.Canceled)
+		}
 		return text, fmt.Errorf("aliyunpan %s 超时", args[0])
 	}
 	if err != nil {
@@ -120,7 +228,8 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 func (c *CLI) environment() []string {
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "ALIYUNPAN_CONFIG_DIR=") {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(key, "ALIYUNPAN_CONFIG_DIR") {
 			continue
 		}
 		env = append(env, entry)
@@ -144,9 +253,7 @@ type Account struct {
 
 // Who returns the currently linked account.
 func (c *CLI) Who(ctx context.Context) (Account, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	output, err := c.run(ctx, runOptions{timeout: time.Minute}, "who")
+	output, err := c.runCommand(ctx, runOptions{timeout: time.Minute}, "who")
 	if strings.Contains(output, notLoggedInMarker) {
 		return Account{}, ErrNotLoggedIn
 	}
@@ -158,24 +265,25 @@ func (c *CLI) Who(ctx context.Context) (Account, error) {
 
 // Logout unlinks the account.
 func (c *CLI) Logout(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	output, err := c.run(ctx, runOptions{timeout: time.Minute}, "logout", "-y")
+	c.CancelLogin()
+	c.CancelRunning()
+	output, err := c.runCommand(ctx, runOptions{timeout: 20 * time.Second}, "logout", "-y")
 	if strings.Contains(output, notLoggedInMarker) || strings.Contains(output, "未设置任何帐号") {
 		return nil
 	}
 	return err
 }
 
-// SetDownloadRate applies a speed cap such as "2MB". An empty value clears
-// nothing — aliyunpan has no "unset" — so callers simply skip the call.
+// SetDownloadRate applies a speed cap such as "2MB". An empty value explicitly
+// writes 0, which is aliyunpan's documented value for unlimited; otherwise a
+// limit previously saved in its config would survive after the plugin setting
+// was cleared.
 func (c *CLI) SetDownloadRate(ctx context.Context, rate string) error {
-	if strings.TrimSpace(rate) == "" {
-		return nil
+	rate = strings.TrimSpace(rate)
+	if rate == "" {
+		rate = "0"
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	output, err := c.run(ctx, runOptions{timeout: time.Minute}, "config", "set", "-max_download_rate", rate)
+	output, err := c.runCommand(ctx, runOptions{timeout: time.Minute}, "config", "set", "-max_download_rate", rate)
 	if err != nil {
 		return err
 	}
@@ -187,10 +295,12 @@ func (c *CLI) SetDownloadRate(ctx context.Context, rate string) error {
 
 // List reads one cloud directory. The `ll` alias is `ls -l`, whose table
 // carries the exact byte size and content hash that `ls` alone omits.
-func (c *CLI) List(ctx context.Context, cloudPath string) ([]Entry, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	output, err := c.run(ctx, runOptions{timeout: 3 * time.Minute}, "ll", cloudPath)
+func (c *CLI) List(ctx context.Context, cloudPath string, driveID ...string) ([]Entry, error) {
+	args := []string{"ll", cloudPath}
+	if id := firstString(driveID); id != "" {
+		args = append(args, "-driveId", id)
+	}
+	output, err := c.runCommand(ctx, runOptions{timeout: 3 * time.Minute}, args...)
 	if strings.Contains(output, notLoggedInMarker) {
 		return nil, ErrNotLoggedIn
 	}
@@ -202,10 +312,12 @@ func (c *CLI) List(ctx context.Context, cloudPath string) ([]Entry, error) {
 
 // Remove deletes a cloud path. It is only reachable from a job that opted into
 // deleting its source, and only after the drive has committed the file.
-func (c *CLI) Remove(ctx context.Context, cloudPath string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	output, err := c.run(ctx, runOptions{timeout: 2 * time.Minute}, "rm", cloudPath)
+func (c *CLI) Remove(ctx context.Context, cloudPath string, driveID ...string) error {
+	args := []string{"rm", cloudPath}
+	if id := firstString(driveID); id != "" {
+		args = append(args, "-driveId", id)
+	}
+	output, err := c.runCommand(ctx, runOptions{timeout: 2 * time.Minute}, args...)
 	if strings.Contains(output, notLoggedInMarker) {
 		return ErrNotLoggedIn
 	}
@@ -216,4 +328,11 @@ func (c *CLI) Remove(ctx context.Context, cloudPath string) error {
 		return fmt.Errorf("删除云端文件失败: %s", strings.TrimSpace(output))
 	}
 	return nil
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
 }

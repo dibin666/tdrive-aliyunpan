@@ -1,13 +1,15 @@
 package aliyunpan
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // The plugin is published for every platform tdrive itself runs on, so the CLI
 // has to be fetchable on all of them. The names below are the assets that
 // actually exist on the pinned release, and upstream does not spell them the
 // way Go does — "windows-x64" rather than "windows-amd64", "darwin-macos-".
-// Getting one wrong installs cleanly and only fails later, when the 账号 tab
-// tries to download the CLI.
 func TestAssetNameMatchesTheUpstreamRelease(t *testing.T) {
 	for _, test := range []struct {
 		goos, goarch, want string
@@ -32,5 +34,28 @@ func TestAssetNameMatchesTheUpstreamRelease(t *testing.T) {
 func TestAssetNameRejectsUnpublishedPlatforms(t *testing.T) {
 	if _, err := assetName("plan9", "amd64"); err == nil {
 		t.Error("assetName accepted plan9/amd64")
+	}
+}
+
+func TestReplaceBinaryReplacesDestination(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, ".new")
+	destination := filepath.Join(dir, "aliyunpan")
+	if err := os.WriteFile(source, []byte("new"), 0o750); err != nil {
+		t.Fatalf("WriteFile source: %v", err)
+	}
+	if err := os.WriteFile(destination, []byte("old"), 0o750); err != nil {
+		t.Fatalf("WriteFile destination: %v", err)
+	}
+
+	if err := replaceBinary(source, destination); err != nil {
+		t.Fatalf("replaceBinary: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("ReadFile destination: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("destination = %q, want new", got)
 	}
 }

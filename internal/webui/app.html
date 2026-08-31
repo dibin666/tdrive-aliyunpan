@@ -449,7 +449,10 @@
     <div id="toast-host"></div>
 
     <script type="module">
-      const API = './api'
+      // The page can be opened with or without a trailing slash. A relative
+      // `./api` would resolve to /plugins/api in the former case, which makes
+      // a direct link look like a broken plugin even though / itself works.
+      const API = (location.pathname.replace(/\/+$/, '') || '/') + '/api'
       const TABS = [
         ['sync', '同步'],
         ['jobs', '任务'],
@@ -493,6 +496,7 @@
         lastLoad: 0,
         editing: null,
         picker: null,
+        pickerRequest: 0,
         planDirty: false,
       }
 
@@ -544,6 +548,33 @@
       function liveSpeed(row, now) {
         if (!row.speedAt) return 0
         return now - row.speedAt < LIVE_SPEED_TTL ? row.speed || 0 : 0
+      }
+
+      const DRIVE_LABEL = { backup: '备份盘', resource: '资源库' }
+
+      function driveLabel(value) {
+        return DRIVE_LABEL[value] || value || '备份盘'
+      }
+
+      function driveOptions(selected) {
+        const drives = (state.snapshot && state.snapshot.account && state.snapshot.account.drives) || []
+        const known = new Set(drives.map((drive) => drive.kind))
+        return ['backup', 'resource']
+          .map((kind) => {
+            const unavailable = known.size > 0 && !known.has(kind)
+            return (
+              '<option value="' +
+              kind +
+              '"' +
+              (selected === kind ? ' selected' : '') +
+              (unavailable ? ' disabled' : '') +
+              '>' +
+              esc(driveLabel(kind)) +
+              (unavailable ? '（当前账号不可用）' : '') +
+              '</option>'
+            )
+          })
+          .join('')
       }
 
       let toastTimer = null
@@ -817,6 +848,7 @@
           expanded
             ? '<dl class="detail">' +
               detail('云端路径', row.remotePath) +
+              detail('网盘', driveLabel(row.driveName)) +
               detail('目标路径', row.targetPath) +
               detail('状态', STATUS_LABEL[row.state] + (row.stage ? ' · ' + (STAGE_LABEL[row.stage] || '') : '')) +
               detail('已下载', bytes(row.downloaded)) +
@@ -852,7 +884,13 @@
                     '<span class="dot" data-on="' + (job.enabled ? 'true' : 'false') + '"></span>' +
                     '<div style="flex:1;min-width:0">' +
                     '<div style="font-size:.875rem">' + esc(job.name) + '</div>' +
-                    '<div class="hint mono">' + esc(job.remotePath) + ' → ' + esc(job.targetPath) + '</div>' +
+                    '<div class="hint mono">' +
+                    esc(driveLabel(job.driveName)) +
+                    ' · ' +
+                    esc(job.remotePath) +
+                    ' → ' +
+                    esc(job.targetPath) +
+                    '</div>' +
                     '</div>' +
                     (job.deleteAfterUpload
                       ? '<span class="chip danger-text">上传后删除云端</span>'
@@ -910,7 +948,7 @@
           '<div class="form">',
           field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage'),
           field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 的暂存上限'),
-          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '传给 aliyunpan 的 max_download_rate'),
+          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '传给 aliyunpan 的 max_download_rate，留空表示不限速'),
           field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空使用第一个管理员" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归谁、占谁的配额'),
           field('aliyunpan 路径', '<input class="input" id="binary-path" placeholder="留空使用插件下载的版本" value="' + esc((state.settings && state.settings.binaryPath) || '') + '">', '离线部署或自编译版本填这里'),
           '</div>',
@@ -984,6 +1022,10 @@
               stat('昵称', account.nickname || '—') +
               stat('UID', account.userId || '—') +
               stat('网盘', account.driveName || '—') +
+              stat(
+                '可用网盘',
+                (account.drives || []).map((drive) => drive.name || driveLabel(drive.kind)).join('、') || '—',
+              ) +
               '</div>' +
               '<div class="toolbar" style="margin-top:.75rem"><button class="btn btn-danger" id="logout-btn" type="button">退出登录</button>' +
               '<button class="btn btn-ghost" id="refresh-account" type="button">刷新</button></div>'
@@ -1034,8 +1076,8 @@
       // form has to still be there underneath when the picker closes.
       function renderOverlay(force) {
         const overlay = document.getElementById('overlay')
-        const key = state.picker
-          ? ['picker', state.picker.kind, state.picker.path, state.picker.loading, state.picker.error].join('|')
+          const key = state.picker
+          ? ['picker', state.picker.request, state.picker.kind, state.picker.driveName, state.picker.path, state.picker.loading, state.picker.error].join('|')
           : state.editing
             ? 'job|' + (state.editing.id || 'new')
             : ''
@@ -1056,6 +1098,11 @@
           '<div><label class="switch"><input type="checkbox" id="job-enabled"' +
             (job.enabled !== false ? ' checked' : '') +
             '> 启用</label></div>',
+          field(
+            '云盘',
+            '<select class="input" id="job-drive">' + driveOptions(job.driveName || 'backup') + '</select>',
+            '每个任务独立选择备份盘或资源库，不依赖 aliyunpan 当前工作盘',
+          ),
           '<div class="field-wide">' +
             '<label class="label">云盘目录</label>' +
             '<div class="toolbar"><input class="input" id="job-remote" value="' + esc(job.remotePath || '/') + '">' +
@@ -1092,7 +1139,7 @@
       function pickerModal(picker) {
         return [
           '<div class="modal-backdrop" data-close-modal="1"><div class="modal">',
-          '<h2>' + (picker.kind === 'remote' ? '选择云盘目录' : '选择 tdrive 目录') + '</h2>',
+          '<h2>' + (picker.kind === 'remote' ? '选择' + driveLabel(picker.driveName) + '目录' : '选择 tdrive 目录') + '</h2>',
           '<div class="mono" style="margin-bottom:.5rem">' + esc(picker.path) + '</div>',
           picker.error ? '<div class="error-box">' + esc(picker.error) + '</div>' : '',
           '<div class="picker">',
@@ -1209,7 +1256,7 @@
             await act('/queue/clear', null, '历史已清空')
             return
           case 'new-job':
-            state.editing = { enabled: true, remotePath: '/', targetPath: '/阿里云盘' }
+            state.editing = { enabled: true, driveName: 'backup', remotePath: '/', targetPath: '/阿里云盘' }
             renderOverlay(true)
             return
           case 'save-job':
@@ -1294,6 +1341,7 @@
           enabled: checked('job-enabled'),
           remotePath: value('job-remote'),
           targetPath: value('job-target'),
+          driveName: value('job-drive') || 'backup',
           minSizeBytes: Math.round(Number(value('job-min') || 0) * 1048576),
           maxSizeBytes: Math.round(Number(value('job-max') || 0) * 1048576),
           excludeNames: value('job-exclude')
@@ -1357,14 +1405,24 @@
       }
 
       async function openPicker(kind, path) {
-        state.picker = { kind, path: path || '/', loading: true, entries: [], error: '' }
+        const selectedPath = path || '/'
+        const driveName = state.editing && state.editing.driveName ? state.editing.driveName : 'backup'
+        const request = ++state.pickerRequest
+        state.picker = { request, kind, driveName, path: selectedPath, loading: true, entries: [], error: '' }
         renderOverlay(true)
         const endpoint = kind === 'remote' ? '/browse' : '/drive/browse'
         try {
-          const result = await call(endpoint + '?path=' + encodeURIComponent(state.picker.path))
+          const result = await call(
+            endpoint +
+              '?path=' +
+              encodeURIComponent(selectedPath) +
+              (kind === 'remote' ? '&driveName=' + encodeURIComponent(driveName) : ''),
+          )
           const entries = (result.entries || []).filter((entry) => entry.isDir)
+          if (!state.picker || state.picker.request !== request) return
           state.picker = { ...state.picker, path: result.path, entries, loading: false }
         } catch (error) {
+          if (!state.picker || state.picker.request !== request) return
           state.picker = { ...state.picker, loading: false, error: error.message }
         }
         renderOverlay(true)

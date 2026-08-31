@@ -152,6 +152,47 @@ func TestParseWhoRejectsGarbage(t *testing.T) {
 	}
 }
 
+func TestParseDrives(t *testing.T) {
+	output := `  #   DRIVE ID       网盘名称
+  1   11519221       备份盘
+  2   1311893110     资源库
+  3   123             相册
+`
+	drives, err := parseDrives(output)
+	if err != nil {
+		t.Fatalf("parseDrives: %v", err)
+	}
+	if len(drives) != 2 {
+		t.Fatalf("got %d drives, want 2: %+v", len(drives), drives)
+	}
+	if drives[0] != (Drive{ID: "11519221", Name: "备份盘", Kind: DriveBackup}) {
+		t.Errorf("backup drive = %+v", drives[0])
+	}
+	if drives[1] != (Drive{ID: "1311893110", Name: "资源库", Kind: DriveResource}) {
+		t.Errorf("resource drive = %+v", drives[1])
+	}
+}
+
+func TestNormalizeDriveName(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{"", DriveBackup},
+		{"备份盘", DriveBackup},
+		{"file", DriveBackup},
+		{" resource ", DriveResource},
+		{"资源盘", DriveResource},
+	} {
+		got, err := NormalizeDriveName(test.input)
+		if err != nil || got != test.want {
+			t.Errorf("NormalizeDriveName(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+	if _, err := NormalizeDriveName("album"); err == nil {
+		t.Error("NormalizeDriveName accepted the unsupported album drive")
+	}
+}
+
 func TestStagedPath(t *testing.T) {
 	// aliyunpan joins the save directory with the file's whole cloud path, not
 	// just its name, so the staging tree mirrors the cloud tree.
@@ -159,6 +200,20 @@ func TestStagedPath(t *testing.T) {
 	want := "/var/stage/我的资源/影视/a.mkv"
 	if got != want {
 		t.Errorf("StagedPath = %q, want %q", got, want)
+	}
+}
+
+func TestCleanDownloadPathRejectsRootAndWindowsSeparators(t *testing.T) {
+	if _, err := cleanDownloadPath("/"); err == nil {
+		t.Fatal("root must not be treated as a file")
+	}
+	if _, err := cleanDownloadPath(`/a\\b`); err == nil {
+		t.Fatal("a Windows separator must not escape the staging tree")
+	}
+	for _, name := range []string{"CON.txt", "name?", "trailing.", "a/../b"} {
+		if _, err := cleanDownloadPath("/" + name); err == nil {
+			t.Errorf("unsafe path %q was accepted", name)
+		}
 	}
 }
 

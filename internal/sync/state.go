@@ -40,6 +40,7 @@ type Row struct {
 	ID         string `json:"id"`
 	JobID      string `json:"jobId"`
 	JobName    string `json:"jobName"`
+	DriveName  string `json:"driveName,omitempty"`
 	Name       string `json:"name"`
 	RemotePath string `json:"remotePath"`
 	TargetPath string `json:"targetPath"`
@@ -118,12 +119,14 @@ type LimitsView struct {
 
 // AccountView is the linked Aliyun Drive account.
 type AccountView struct {
-	LoggedIn  bool   `json:"loggedIn"`
-	Nickname  string `json:"nickname,omitempty"`
-	UserID    string `json:"userId,omitempty"`
-	DriveName string `json:"driveName,omitempty"`
-	Error     string `json:"error,omitempty"`
-	CheckedAt int64  `json:"checkedAt,omitempty"`
+	LoggedIn       bool              `json:"loggedIn"`
+	Nickname       string            `json:"nickname,omitempty"`
+	UserID         string            `json:"userId,omitempty"`
+	DriveName      string            `json:"driveName,omitempty"`
+	CurrentDriveID string            `json:"currentDriveId,omitempty"`
+	Drives         []aliyunpan.Drive `json:"drives,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	CheckedAt      int64             `json:"checkedAt,omitempty"`
 }
 
 // probeTTL is how long a cached account or binary probe is reused. Both shell
@@ -136,6 +139,10 @@ type probeCache struct {
 	binary     aliyunpan.BinaryState
 	checkedAt  time.Time
 	refreshing bool
+	// revision prevents a probe that started before logout/login from writing
+	// its stale account back into the cache after that action completed.
+	revision uint64
+	rerun    bool
 }
 
 // State assembles the snapshot.
@@ -144,6 +151,7 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 	// the core's plugin configuration modal writes the same key, and the page
 	// should not show a document that has already been replaced.
 	e.reloadSettings(ctx)
+	e.rollQuota(ctx)
 	limits, limitsErr := e.host.Settings(ctx)
 	if limitsErr != nil {
 		e.logger.Printf("读取 tdrive 运行参数失败: %v", limitsErr)
@@ -162,7 +170,7 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 	rows := make([]Row, 0, len(e.queue))
 	summary := Summary{}
 	oversize := false
-	todayStart := now.Add(-24 * time.Hour).UnixMilli()
+	todayStart := current.Quota.PeriodStart(now).UnixMilli()
 	for _, item := range e.queue {
 		rows = append(rows, item.row())
 		switch item.State {
@@ -261,6 +269,7 @@ func (i *Item) row() Row {
 		ID:         i.ID,
 		JobID:      i.JobID,
 		JobName:    i.JobName,
+		DriveName:  i.DriveName,
 		Name:       i.Name,
 		RemotePath: i.RemotePath,
 		TargetPath: i.TargetPath(),
@@ -343,7 +352,11 @@ func (e *Engine) probe(ctx context.Context) (AccountView, aliyunpan.BinaryState)
 	if shouldRefresh {
 		// Detached from the request: the poll that noticed the staleness must
 		// not wait for a network round trip to Aliyun.
-		go e.refreshProbe(context.WithoutCancel(ctx))
+		if !e.launchProbe(e.backgroundContext()) {
+			e.probeMu.Lock()
+			e.probes.refreshing = false
+			e.probeMu.Unlock()
+		}
 	}
 	if cold {
 		// Before the first probe lands, the configured path and whether the
@@ -359,28 +372,90 @@ func (e *Engine) probe(ctx context.Context) (AccountView, aliyunpan.BinaryState)
 }
 
 // RefreshProbe re-reads the binary and account state now.
-func (e *Engine) RefreshProbe(ctx context.Context) (AccountView, aliyunpan.BinaryState) {
-	e.refreshProbe(ctx)
+func (e *Engine) RefreshProbe(_ context.Context) (AccountView, aliyunpan.BinaryState) {
+	e.invalidateProbe()
+	e.requestProbeRefresh()
 	e.probeMu.Lock()
 	defer e.probeMu.Unlock()
 	return e.probes.account, e.probes.binary
 }
 
+func (e *Engine) requestProbeRefresh() {
+	e.probeMu.Lock()
+	if e.probes.refreshing {
+		e.probes.rerun = true
+		e.probeMu.Unlock()
+		return
+	}
+	e.probes.refreshing = true
+	e.probeMu.Unlock()
+	if !e.launchProbe(e.backgroundContext()) {
+		e.probeMu.Lock()
+		e.probes.refreshing = false
+		e.probeMu.Unlock()
+	}
+}
+
+func (e *Engine) launchProbe(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.mu.Lock()
+	if e.stopping {
+		e.mu.Unlock()
+		return false
+	}
+	e.workers.Add(1)
+	e.mu.Unlock()
+	go func() {
+		defer e.workers.Done()
+		e.refreshProbe(ctx)
+	}()
+	return true
+}
+
+func (e *Engine) accountReady() bool {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	return !e.probes.checkedAt.IsZero() && e.probes.account.LoggedIn
+}
+
 func (e *Engine) refreshProbe(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.probeMu.Lock()
+	revision := e.probes.revision
+	e.probeMu.Unlock()
+	probeCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
 	cli := e.CLI()
 	var (
 		account AccountView
 		binary  aliyunpan.BinaryState
 	)
 	if cli != nil {
-		binary = cli.Probe(ctx)
+		binary = cli.Probe(probeCtx)
 		if binary.Installed {
-			resolved, err := cli.Who(ctx)
+			resolved, err := cli.Who(probeCtx)
 			switch {
 			case err == nil:
 				account = AccountView{
 					LoggedIn: true, Nickname: resolved.Nickname,
 					UserID: resolved.UserID, DriveName: resolved.DriveName,
+				}
+				currentKind, _ := aliyunpan.NormalizeDriveName(resolved.DriveName)
+				drives, driveErr := cli.DrivesForKnownAccount(probeCtx)
+				if driveErr == nil {
+					account.Drives = drives
+					for _, drive := range drives {
+						if drive.Kind == currentKind || drive.Name == resolved.DriveName {
+							account.CurrentDriveID = drive.ID
+							break
+						}
+					}
+				} else {
+					account.Error = "读取网盘列表失败: " + driveErr.Error()
 				}
 			case errors.Is(err, aliyunpan.ErrNotLoggedIn):
 				account = AccountView{}
@@ -392,8 +467,23 @@ func (e *Engine) refreshProbe(ctx context.Context) {
 	account.CheckedAt = time.Now().UnixMilli()
 
 	e.probeMu.Lock()
-	e.probes = probeCache{account: account, binary: binary, checkedAt: time.Now()}
+	stale := e.probes.revision != revision || e.probes.rerun
+	if !stale {
+		e.probes.account = account
+		e.probes.binary = binary
+		e.probes.checkedAt = time.Now()
+	}
+	e.probes.refreshing = false
+	e.probes.rerun = false
 	e.probeMu.Unlock()
+	if stale {
+		// A logout/login or an explicit refresh happened while this command was
+		// in flight. The old result is discarded and exactly one fresh probe is
+		// queued after it releases the CLI gate.
+		e.requestProbeRefresh()
+		return
+	}
+	e.Wake()
 }
 
 func (e *Engine) loginState() aliyunpan.LoginState {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -25,22 +26,29 @@ const maxScanDirectories = 5000
 const maxNameBytes = 255
 
 // StartScan kicks off a scan unless one is already running.
-func (e *Engine) StartScan(ctx context.Context) {
-	e.startScan(ctx)
+func (e *Engine) StartScan(_ context.Context) {
+	// A scan started by an HTTP request is background work. The request context
+	// only exists for the acknowledgement response and must not cancel the scan
+	// as soon as that response is returned. Bind it to the plugin lifetime so a
+	// shutdown can still cancel the scan.
+	e.startScan(e.backgroundContext())
 }
 
 func (e *Engine) startScan(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.mu.Lock()
-	if e.scanning {
+	if e.scanning || e.stopping {
 		e.mu.Unlock()
 		return
 	}
 	e.scanning = true
 	jobs := append([]settings.Job(nil), e.settings.Jobs...)
 	cli := e.cli
+	e.workers.Add(1)
 	e.mu.Unlock()
 
-	e.workers.Add(1)
 	go func() {
 		defer e.workers.Done()
 		err := e.scan(ctx, cli, jobs)
@@ -67,13 +75,46 @@ func (e *Engine) scan(ctx context.Context, cli *aliyunpan.CLI, jobs []settings.J
 	if cli == nil {
 		return errors.New("aliyunpan 尚未配置")
 	}
+	hasEnabledJob := false
+	for _, job := range jobs {
+		if job.Enabled {
+			hasEnabledJob = true
+			break
+		}
+	}
+	if !hasEnabledJob {
+		return nil
+	}
+	drives, err := cli.Drives(ctx)
+	if err != nil {
+		if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
+			e.invalidateProbe()
+			e.requestProbeRefresh()
+		}
+		return err
+	}
 	var failures []string
 	for _, job := range jobs {
 		if !job.Enabled {
 			continue
 		}
-		if err := e.scanJob(ctx, cli, job); err != nil {
+		kind, err := aliyunpan.NormalizeDriveName(job.DriveName)
+		if err != nil {
 			if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
+				return err
+			}
+			failures = append(failures, fmt.Sprintf("%s: %v", job.Name, err))
+			continue
+		}
+		drive, err := resolveDriveForScan(kind, drives)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", job.Name, err))
+			continue
+		}
+		if err := e.scanJob(ctx, cli, job, drive); err != nil {
+			if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
+				e.invalidateProbe()
+				e.requestProbeRefresh()
 				return err
 			}
 			failures = append(failures, fmt.Sprintf("%s: %v", job.Name, err))
@@ -85,7 +126,30 @@ func (e *Engine) scan(ctx context.Context, cli *aliyunpan.CLI, jobs []settings.J
 	return nil
 }
 
-func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.Job) error {
+func resolveDriveForScan(kind string, drives []aliyunpan.Drive) (aliyunpan.Drive, error) {
+	for _, drive := range drives {
+		if drive.Kind == kind {
+			return drive, nil
+		}
+	}
+	label := "备份盘"
+	if kind == aliyunpan.DriveResource {
+		label = "资源库"
+	}
+	return aliyunpan.Drive{}, fmt.Errorf("当前阿里云盘账号没有%s", label)
+}
+
+func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.Job, selected ...aliyunpan.Drive) error {
+	drive := aliyunpan.Drive{}
+	if len(selected) > 0 {
+		drive = selected[0]
+	} else {
+		var err error
+		drive, err = cli.ResolveDrive(ctx, job.DriveName)
+		if err != nil {
+			return err
+		}
+	}
 	excludes := make([]*regexp.Regexp, 0, len(job.ExcludeNames))
 	for _, pattern := range job.ExcludeNames {
 		compiled, err := regexp.Compile(pattern)
@@ -110,7 +174,7 @@ func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.J
 			return fmt.Errorf("目录数超过 %d，停止扫描", maxScanDirectories)
 		}
 
-		entries, err := cli.List(ctx, cloudDir)
+		entries, err := cli.List(ctx, cloudDir, drive.ID)
 		if err != nil {
 			return err
 		}
@@ -185,9 +249,17 @@ func (e *Engine) consider(
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	currentJob, current := e.settings.JobByID(job.ID)
+	if !current || !reflect.DeepEqual(currentJob, job) {
+		// A scan may have started just before the operator edited this job. Do
+		// not let its old snapshot enqueue work with the previous drive,
+		// destination, filters, or delete policy.
+		return
+	}
 	candidate := &Item{
 		JobID:      job.ID,
 		RemotePath: entry.Path,
+		Size:       entry.Size,
 		SHA1:       entry.SHA1,
 	}
 	for _, item := range e.queue {
@@ -197,7 +269,7 @@ func (e *Engine) consider(
 		// A file already waiting or running is not queued twice. One that
 		// failed is left alone too: retrying it is an explicit decision, so
 		// the next scan does not silently loop on a permanent error.
-		if item.Active() || item.State == StateFailed {
+		if item.Active() || item.State == StateFailed || item.State == StateCancelled {
 			return
 		}
 	}
@@ -206,6 +278,7 @@ func (e *Engine) consider(
 		ID:          newID(),
 		JobID:       job.ID,
 		JobName:     job.Name,
+		DriveName:   job.DriveName,
 		RemotePath:  entry.Path,
 		TargetDir:   targetDir,
 		Name:        entry.Name,
@@ -222,7 +295,7 @@ func (e *Engine) consider(
 		item.FinishedAt = item.CreatedAt
 	}
 	e.queue = append(e.queue, item)
-	e.dirty = true
+	e.markQueueDirtyLocked()
 }
 
 // unstorableName reports why tdrive would refuse a name, or "" if it would
@@ -231,6 +304,8 @@ func unstorableName(name string) string {
 	switch {
 	case name == "" || name == "." || name == "..":
 		return "文件名不合法"
+	case unsafeFileName(name):
+		return "文件名含有路径分隔符、Windows 保留字符或设备名"
 	case len(name) > maxNameBytes:
 		return fmt.Sprintf("文件名 %d 字节，超过 tdrive 的 %d 字节上限", len(name), maxNameBytes)
 	}
@@ -242,10 +317,33 @@ func unstorableName(name string) string {
 	return ""
 }
 
+func unsafeFileName(name string) bool {
+	if strings.ContainsAny(name, `<>:"/\\|?*`) || strings.TrimRight(name, " .") != name {
+		return true
+	}
+	base := strings.ToUpper(name)
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	switch base {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
+}
+
 // mapPath rebases a cloud path from the job's source root onto its target
 // root.
 func mapPath(remoteRoot, targetRoot, cloudPath string) string {
-	relative := strings.TrimPrefix(cloudPath, remoteRoot)
+	relative := cloudPath
+	if cloudPath == remoteRoot {
+		relative = ""
+	} else if strings.HasPrefix(cloudPath, remoteRoot+"/") {
+		relative = strings.TrimPrefix(cloudPath, remoteRoot)
+	}
 	relative = strings.Trim(relative, "/")
 	if relative == "" {
 		return targetRoot

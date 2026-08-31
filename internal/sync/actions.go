@@ -16,12 +16,21 @@ import (
 // HTTP route thirty seconds, and the archive is large enough that a modest
 // link needs longer. The 账号 tab polls Snapshot.Installing instead.
 func (e *Engine) InstallBinary(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cli := e.CLI()
 	if cli == nil {
 		return errors.New("aliyunpan 尚未配置")
 	}
 	if !cli.Managed() {
 		return errors.New("配置里指定了自定义 aliyunpan 路径，插件不会覆盖它")
+	}
+	e.mu.Lock()
+	stopping := e.stopping
+	e.mu.Unlock()
+	if stopping {
+		return errors.New("插件正在停止")
 	}
 
 	e.probeMu.Lock()
@@ -32,28 +41,37 @@ func (e *Engine) InstallBinary(ctx context.Context) error {
 	e.installing = true
 	e.installError = ""
 	e.probeMu.Unlock()
-
-	detached := context.WithoutCancel(ctx)
+	e.mu.Lock()
+	if e.stopping {
+		e.mu.Unlock()
+		e.probeMu.Lock()
+		e.installing = false
+		e.probeMu.Unlock()
+		return errors.New("插件正在停止")
+	}
 	e.workers.Add(1)
+	e.mu.Unlock()
+
+	background := e.backgroundContext()
 	go func() {
 		defer e.workers.Done()
-		err := cli.InstallManaged(detached)
+		err := cli.InstallManaged(background)
 
 		e.probeMu.Lock()
 		e.installing = false
 		if err != nil {
 			e.installError = err.Error()
 		}
+		e.probeMu.Unlock()
 		// Force the next probe to re-read the binary rather than serve the
 		// pre-install cache.
-		e.probes.checkedAt = time.Time{}
-		e.probeMu.Unlock()
+		e.invalidateProbe()
 
 		if err != nil {
 			e.logger.Printf("下载 aliyunpan 失败: %v", err)
 			return
 		}
-		e.refreshProbe(detached)
+		e.requestProbeRefresh()
 		e.Wake()
 	}()
 	return nil
@@ -78,7 +96,7 @@ func (e *Engine) ConfirmLogin(ctx context.Context) (aliyunpan.LoginState, error)
 	state, err := cli.ConfirmLogin(ctx)
 	if err == nil && state.Phase == aliyunpan.LoginDone {
 		e.invalidateProbe()
-		e.refreshProbe(context.WithoutCancel(ctx))
+		e.requestProbeRefresh()
 		e.Wake()
 	}
 	return state, err
@@ -97,16 +115,19 @@ func (e *Engine) Logout(ctx context.Context) error {
 	if cli == nil {
 		return errors.New("aliyunpan 尚未配置")
 	}
-	if err := cli.Logout(ctx); err != nil {
-		return err
-	}
 	e.invalidateProbe()
-	e.refreshProbe(ctx)
-	return nil
+	err := cli.Logout(ctx)
+	// A probe can have completed its `who` call just before Logout cancelled
+	// it. Invalidate again after logout so that result cannot make the scheduler
+	// believe the account is still linked.
+	e.invalidateProbe()
+	e.requestProbeRefresh()
+	e.Wake()
+	return err
 }
 
 // Browse lists a cloud directory for the target picker.
-func (e *Engine) Browse(ctx context.Context, path string) ([]aliyunpan.Entry, error) {
+func (e *Engine) Browse(ctx context.Context, path string, driveName ...string) ([]aliyunpan.Entry, error) {
 	cli := e.CLI()
 	if cli == nil {
 		return nil, errors.New("aliyunpan 尚未配置")
@@ -114,7 +135,15 @@ func (e *Engine) Browse(ctx context.Context, path string) ([]aliyunpan.Entry, er
 	if path == "" {
 		path = "/"
 	}
-	entries, err := cli.List(ctx, path)
+	selectedDrive := ""
+	if len(driveName) > 0 {
+		selectedDrive = driveName[0]
+	}
+	drive, err := cli.ResolveDrive(ctx, selectedDrive)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := cli.List(ctx, path, drive.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +174,33 @@ func (e *Engine) UpsertJob(ctx context.Context, job settings.Job) error {
 	if err := e.SaveSettings(ctx, current); err != nil {
 		return err
 	}
-	e.StartScan(ctx)
+	// Pending candidates contain the old source/target/drive snapshot. Keeping
+	// them after an edit would upload them to the old destination or from the
+	// old drive; running items are left alone so an in-flight upload can finish
+	// safely.
+	e.mu.Lock()
+	remaining := e.queue[:0]
+	dropped := false
+	for _, item := range e.queue {
+		if replaced && item.JobID == job.ID && item.State != StateRunning && item.State != StateComplete {
+			dropped = true
+			continue
+		}
+		remaining = append(remaining, item)
+	}
+	e.queue = remaining
+	if dropped {
+		e.markQueueDirtyLocked()
+	}
+	e.mu.Unlock()
+	if e.accountReady() {
+		e.StartScan(ctx)
+	} else {
+		// The startup probe or a login completion will wake the scheduler once
+		// there is an account to scan. Starting a CLI process before that only
+		// creates noisy failed scans.
+		e.Wake()
+	}
 	return nil
 }
 
@@ -173,12 +228,13 @@ func (e *Engine) DeleteJob(ctx context.Context, id string) error {
 	e.mu.Lock()
 	remaining := e.queue[:0]
 	for _, item := range e.queue {
-		if item.JobID == id && item.Active() {
+		if item.JobID == id && item.State == StatePending {
 			continue
 		}
 		remaining = append(remaining, item)
 	}
 	e.queue = remaining
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
 	return nil
@@ -186,6 +242,11 @@ func (e *Engine) DeleteJob(ctx context.Context, id string) error {
 
 func (e *Engine) invalidateProbe() {
 	e.probeMu.Lock()
+	e.probes.revision++
 	e.probes.checkedAt = time.Time{}
+	e.probes.account = AccountView{}
+	if e.probes.refreshing {
+		e.probes.rerun = true
+	}
 	e.probeMu.Unlock()
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,9 @@ const progressInterval = 700 * time.Millisecond
 type DownloadRequest struct {
 	CloudPath string
 	StageDir  string
+	// DriveID is the account-specific backup/resource drive ID. Empty keeps
+	// aliyunpan's active-drive behavior for callers that do not select a drive.
+	DriveID string
 	// SliceParallel is aliyunpan's -sp, the number of connections used for a
 	// single file. Aliyun rejects more than 3.
 	SliceParallel int
@@ -37,7 +41,8 @@ type DownloadRequest struct {
 // directory with the file's full cloud path rather than just its name, so the
 // staging tree mirrors the cloud tree.
 func StagedPath(stageDir, cloudPath string) string {
-	return filepath.Join(stageDir, filepath.FromSlash(strings.TrimPrefix(cloudPath, "/")))
+	clean := path.Clean("/" + strings.TrimSpace(cloudPath))
+	return filepath.Join(stageDir, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
 }
 
 // Download stages one cloud file on local disk.
@@ -51,6 +56,9 @@ func (c *CLI) Download(
 	expectedSize int64,
 	progress func(done int64),
 ) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if request.SliceParallel < 1 {
 		request.SliceParallel = 1
 	}
@@ -68,28 +76,49 @@ func (c *CLI) Download(
 	if err := os.MkdirAll(request.StageDir, 0o750); err != nil {
 		return "", fmt.Errorf("创建暂存目录: %w", err)
 	}
+	cleanPath, err := cleanDownloadPath(request.CloudPath)
+	if err != nil {
+		return "", err
+	}
+	request.CloudPath = cleanPath
 
 	staged := StagedPath(request.StageDir, request.CloudPath)
 	partial := staged + DownloadSuffix
 	// A partial left by a killed process would otherwise be resumed against a
 	// download-state database this plugin does not manage.
-	_ = os.Remove(partial)
-	_ = os.Remove(staged)
+	for _, oldPath := range []string{partial, staged} {
+		if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("清理上次下载文件 %s: %w", oldPath, err)
+		}
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(partial)
+			_ = os.Remove(staged)
+		}
+	}()
 
 	watchCtx, stopWatching := context.WithCancel(ctx)
 	defer stopWatching()
 	if progress != nil {
-		go watchProgress(watchCtx, partial, staged, progress)
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			watchProgress(watchCtx, partial, staged, progress)
+		}()
+		defer func() {
+			stopWatching()
+			<-watchDone
+		}()
 	}
 
-	// Downloads are serialized against each other but not against the short
-	// commands above. aliyunpan rewrites its config file after every command,
-	// so in principle a multi-hour download's final save can revert a token
-	// refreshed by a concurrent `ll`; the cost of that is one extra token
-	// refresh, whereas holding the short-command lock for hours would freeze
-	// the directory browser in the UI.
-	c.downloadMu.Lock()
-	output, err := c.run(ctx, runOptions{timeout: request.Timeout},
+	// Downloads share the same command gate as the short commands. aliyunpan
+	// rewrites its config file after every command, so allowing a multi-hour
+	// download beside `ll` or `who` could overwrite a refreshed token or drive
+	// selection. The UI keeps the browser responsive because each request is
+	// still independent and the gate is acquired with its request context.
+	args := []string{
 		"download", request.CloudPath,
 		"-saveto", request.StageDir,
 		"-np",
@@ -97,8 +126,11 @@ func (c *CLI) Download(
 		"-p", "1",
 		"-sp", strconv.Itoa(request.SliceParallel),
 		"-retry", strconv.Itoa(request.Retry),
-	)
-	c.downloadMu.Unlock()
+	}
+	if request.DriveID != "" {
+		args = append(args, "-driveId", request.DriveID)
+	}
+	output, err := c.runCommand(ctx, runOptions{timeout: request.Timeout}, args...)
 	stopWatching()
 
 	if strings.Contains(output, notLoggedInMarker) {
@@ -117,14 +149,58 @@ func (c *CLI) Download(
 	if statErr != nil {
 		return "", fmt.Errorf("下载后找不到 %s: %s", staged, lastLines(output, 6))
 	}
-	if expectedSize > 0 && info.Size() != expectedSize {
+	if expectedSize >= 0 && info.Size() != expectedSize {
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("下载的文件大小是 %d，云端记录是 %d", info.Size(), expectedSize)
 	}
 	if progress != nil {
 		progress(info.Size())
 	}
+	success = true
 	return staged, nil
+}
+
+func cleanDownloadPath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("云盘下载路径不能为空")
+	}
+	if strings.ContainsRune(raw, 0) {
+		return "", fmt.Errorf("云盘下载路径含有 NUL 字符")
+	}
+	clean := path.Clean("/" + raw)
+	if clean == "/" {
+		return "", fmt.Errorf("不能把云盘根目录当作文件下载")
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(raw, "/"), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("云盘下载路径不能含有 .. 路径段")
+		}
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
+		if part == "" || part == "." || part == ".." || unsafeWindowsName(part) {
+			return "", fmt.Errorf("云盘下载路径含有不安全的文件名: %q", part)
+		}
+	}
+	return clean, nil
+}
+
+func unsafeWindowsName(name string) bool {
+	if strings.ContainsAny(name, `<>:"/\\|?*`) || strings.TrimRight(name, " .") != name {
+		return true
+	}
+	base := strings.ToUpper(name)
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	switch base {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
 }
 
 // watchProgress samples the partial file until the download ends. It also

@@ -42,6 +42,29 @@ func IsHostCall(ctx context.Context) bool {
 	return bypass
 }
 
+// deadlineUnixMilli and contextWithDeadline are the small wire-level bridge
+// used by both directions of the RPC connection. Context values themselves
+// cannot cross net/rpc, but a deadline can, and preserving it prevents a host
+// request from being held open by a nested plugin/host call after its caller
+// has already timed out.
+func deadlineUnixMilli(ctx context.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return deadline.UnixMilli()
+}
+
+func contextWithDeadline(deadline int64) (context.Context, context.CancelFunc) {
+	if deadline <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithDeadline(context.Background(), time.UnixMilli(deadline))
+}
+
 // Operation is the generic interception envelope. Keeping the payload as
 // JSON makes the API forward-compatible: a new host operation does not force
 // every existing plugin to rebuild before it can load.
@@ -49,6 +72,9 @@ type Operation struct {
 	Name    string          `json:"name"`
 	UserID  string          `json:"userId,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
+	// DeadlineUnixMilli is transport metadata, not part of the operation JSON.
+	// It lets a hook's reverse Host call stop with the original request.
+	DeadlineUnixMilli int64 `json:"-"`
 }
 
 // OperationResult lets a plugin reject an operation or replace its payload.
@@ -65,6 +91,8 @@ type Event struct {
 	Data   json.RawMessage `json:"data"`
 	At     time.Time       `json:"at"`
 	UserID string          `json:"userId,omitempty"`
+	// DeadlineUnixMilli is transport metadata, not event payload.
+	DeadlineUnixMilli int64 `json:"-"`
 }
 
 // HTTPRequest is the serializable subset of an HTTP request exposed to a
@@ -78,6 +106,11 @@ type HTTPRequest struct {
 	Body       []byte              `json:"body,omitempty"`
 	UserID     string              `json:"userId,omitempty"`
 	RemoteAddr string              `json:"remoteAddr,omitempty"`
+	// DeadlineUnixMilli carries the host HTTP request deadline across the RPC
+	// boundary. Without it a plugin can keep a reverse Host call alive after the
+	// host has already timed out the browser request, which leaves the plugin
+	// process looking dead to the host.
+	DeadlineUnixMilli int64 `json:"deadlineUnixMilli,omitempty"`
 }
 
 // HTTPResponse is returned by a plugin route.

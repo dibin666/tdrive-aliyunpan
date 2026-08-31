@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -116,6 +117,16 @@ func TestNormalizeDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeJobDefaultsToBackupDrive(t *testing.T) {
+	document := Settings{Jobs: []Job{{ID: "j1", RemotePath: "/a", TargetPath: "/b"}}}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if document.Jobs[0].DriveName != DefaultDriveName {
+		t.Fatalf("driveName = %q, want %q", document.Jobs[0].DriveName, DefaultDriveName)
+	}
+}
+
 func TestNormalizeRejections(t *testing.T) {
 	cases := map[string]Settings{
 		"相对二进制路径":  {BinaryPath: "bin/aliyunpan"},
@@ -129,11 +140,23 @@ func TestNormalizeRejections(t *testing.T) {
 		"任务 ID 非法": {Jobs: []Job{{ID: "bad id!", RemotePath: "/a", TargetPath: "/b"}}},
 		"排除规则非法":   {Jobs: []Job{{ID: "j1", RemotePath: "/a", TargetPath: "/b", ExcludeNames: []string{"("}}}},
 		"大小区间颠倒":   {Jobs: []Job{{ID: "j1", RemotePath: "/a", TargetPath: "/b", MinSizeBytes: 10, MaxSizeBytes: 5}}},
+		"路径含 NUL":  {Jobs: []Job{{ID: "j1", RemotePath: "/a\x00b", TargetPath: "/b"}}},
 	}
 	for name, document := range cases {
 		if err := document.Normalize(); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+func TestNormalizeAcceptsPlatformAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	document := Settings{
+		BinaryPath: filepath.Join(root, "bin", "aliyunpan"),
+		StageDir:   filepath.Join(root, "stage"),
+	}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize rejected absolute paths: %v", err)
 	}
 }
 
@@ -144,6 +167,13 @@ func TestNormalizeRejectsDuplicateJobIDs(t *testing.T) {
 	}}
 	if err := document.Normalize(); err == nil {
 		t.Fatal("expected an error for duplicate job IDs")
+	}
+}
+
+func TestNormalizeRejectsUnsupportedDrive(t *testing.T) {
+	document := Settings{Jobs: []Job{{ID: "j1", DriveName: "album", RemotePath: "/a", TargetPath: "/b"}}}
+	if err := document.Normalize(); err == nil {
+		t.Fatal("expected an unsupported drive to be rejected")
 	}
 }
 

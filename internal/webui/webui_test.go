@@ -220,6 +220,14 @@ func TestMethodIsChecked(t *testing.T) {
 	if response.Status != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", response.Status)
 	}
+	response, _ = server.Handle(context.Background(), request(http.MethodPost, "/api/state", "admin-1", ""))
+	if response.Status != http.StatusMethodNotAllowed {
+		t.Errorf("state POST status = %d, want 405", response.Status)
+	}
+	response, _ = server.Handle(context.Background(), request(http.MethodGet, "/api/queue/clear", "admin-1", ""))
+	if response.Status != http.StatusMethodNotAllowed {
+		t.Errorf("clear GET status = %d, want 405", response.Status)
+	}
 }
 
 func TestPauseAndResume(t *testing.T) {

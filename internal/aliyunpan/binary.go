@@ -99,6 +99,9 @@ func executableName() string {
 // aliyunpan is a statically linked Go binary, so dropping it into the plugin's
 // own data directory and exec'ing it is enough.
 func Install(ctx context.Context, destination string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	url, err := DownloadURL()
 	if err != nil {
 		return err
@@ -183,9 +186,44 @@ func extractTo(entry *zip.File, destination string) error {
 	if err := os.Chmod(temporary.Name(), 0o750); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary.Name(), destination); err != nil {
+	if err := replaceBinary(temporary.Name(), destination); err != nil {
 		return fmt.Errorf("安装 aliyunpan: %w", err)
 	}
+	return nil
+}
+
+// replaceBinary is an atomic rename on Unix and a recoverable two-rename
+// replacement on Windows, where os.Rename refuses to overwrite an existing
+// file. The old executable is kept until the new one is in place; if the
+// second rename fails it is restored.
+func replaceBinary(source, destination string) error {
+	if err := os.Rename(source, destination); err == nil {
+		return nil
+	}
+
+	old, err := os.CreateTemp(filepath.Dir(destination), ".aliyunpan-old-*")
+	if err != nil {
+		return err
+	}
+	backup := old.Name()
+	if err := old.Close(); err != nil {
+		_ = os.Remove(backup)
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	if err := os.Rename(destination, backup); err != nil {
+		if os.IsNotExist(err) {
+			return os.Rename(source, destination)
+		}
+		return err
+	}
+	if err := os.Rename(source, destination); err != nil {
+		_ = os.Rename(backup, destination)
+		return err
+	}
+	_ = os.Remove(backup)
 	return nil
 }
 
@@ -208,7 +246,7 @@ func (c *CLI) Probe(ctx context.Context) BinaryState {
 		return state
 	}
 	state.Installed = true
-	output, err := c.run(ctx, runOptions{timeout: 30 * time.Second}, "--version")
+	output, err := c.runCommand(ctx, runOptions{timeout: 30 * time.Second}, "--version")
 	if err != nil {
 		state.Error = err.Error()
 		return state

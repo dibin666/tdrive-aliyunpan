@@ -66,6 +66,9 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 
 	switch path {
 	case "/api/state":
+		if request.Method != http.MethodGet {
+			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
+		}
 		return okJSON(s.engine.State(ctx))
 
 	case "/api/settings":
@@ -125,29 +128,44 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		return okJSON(map[string]bool{"paused": false})
 
 	case "/api/queue/retry":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
 		if err := s.engine.Retry(ctx, query.Get("id")); err != nil {
 			return status(http.StatusBadRequest, err.Error()), nil
 		}
 		return okJSON(map[string]bool{"ok": true})
 
 	case "/api/queue/cancel":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
 		if err := s.engine.Cancel(ctx, query.Get("id")); err != nil {
 			return status(http.StatusBadRequest, err.Error()), nil
 		}
 		return okJSON(map[string]bool{"ok": true})
 
 	case "/api/queue/clear":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
 		s.engine.ClearFinished(ctx)
 		return okJSON(map[string]bool{"ok": true})
 
 	case "/api/browse":
-		entries, err := s.engine.Browse(ctx, query.Get("path"))
+		if request.Method != http.MethodGet {
+			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
+		}
+		entries, err := s.engine.Browse(ctx, query.Get("path"), query.Get("driveName"))
 		if err != nil {
 			return status(http.StatusBadGateway, err.Error()), nil
 		}
 		return okJSON(map[string]any{"path": browsePath(query.Get("path")), "entries": entries})
 
 	case "/api/drive/browse":
+		if request.Method != http.MethodGet {
+			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
+		}
 		target := browsePath(query.Get("path"))
 		entries, err := s.host.List(ctx, target)
 		if err != nil {
@@ -174,6 +192,9 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		return okJSON(map[string]bool{"installing": true})
 
 	case "/api/account":
+		if request.Method != http.MethodGet {
+			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
+		}
 		account, binary := s.engine.RefreshProbe(ctx)
 		return okJSON(map[string]any{"account": account, "binary": binary})
 

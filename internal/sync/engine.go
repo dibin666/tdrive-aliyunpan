@@ -3,9 +3,12 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -44,24 +47,35 @@ type Engine struct {
 	// under it.
 	dataDir string
 
-	mu        sync.Mutex
-	settings  settings.Settings
-	queue     []*Item
-	quota     QuotaState
-	active    int
-	reserved  int64
-	lastScan  time.Time
-	scanning  bool
-	scanError string
-	paused    bool
+	mu            sync.Mutex
+	settings      settings.Settings
+	queue         []*Item
+	quota         QuotaState
+	active        int
+	reserved      int64
+	stageReserved int64
+	lastScan      time.Time
+	scanning      bool
+	scanError     string
+	paused        bool
+	stopping      bool
+	// runCtx is the plugin-lifetime context. HTTP-triggered background work
+	// uses it instead of the short-lived request context, but still stops when
+	// the host shuts the plugin down.
+	runCtx context.Context
 	// lastPersist throttles progress writes; dirty records that a write is
 	// owed.
-	lastPersist time.Time
-	dirty       bool
+	lastPersist   time.Time
+	dirty         bool
+	queueRevision uint64
+	quotaRevision uint64
+	quotaDirty    bool
+	persistMu     sync.Mutex
 
 	wake chan struct{}
 	// running counts in-flight transfers so Close can wait for them.
 	workers sync.WaitGroup
+	runDone chan struct{}
 
 	// probeMu guards the cached aliyunpan account and binary state. They are
 	// cached because both shell out and one of them makes a network call,
@@ -75,6 +89,9 @@ type Engine struct {
 
 // New builds an engine. It does not touch the host; call Load first.
 func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
 	return &Engine{
 		host:     host,
 		dataDir:  dataDir,
@@ -82,6 +99,7 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 		settings: settings.Default(),
 		queue:    []*Item{},
 		wake:     make(chan struct{}, 1),
+		runDone:  make(chan struct{}),
 	}
 }
 
@@ -129,6 +147,9 @@ func (e *Engine) Load(ctx context.Context) error {
 		if item == nil {
 			continue
 		}
+		if item.DriveName == "" {
+			item.DriveName = settings.DefaultDriveName
+		}
 		// Anything that was running when the process stopped is put back in
 		// the queue: segments already in Telegram are re-sent, which is
 		// wasteful but always correct, whereas trusting a counter written
@@ -143,6 +164,10 @@ func (e *Engine) Load(ctx context.Context) error {
 		e.queue = append(e.queue, item)
 	}
 	e.cli = aliyunpan.New(e.aliyunpanDir(), stored.BinaryPath)
+	e.dirty = false
+	e.quotaDirty = false
+	e.queueRevision = 0
+	e.quotaRevision = 0
 	e.mu.Unlock()
 	return nil
 }
@@ -165,7 +190,12 @@ func (e *Engine) StageDir() string {
 func (e *Engine) Settings() settings.Settings {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.settings
+	copy := e.settings
+	copy.Jobs = append([]settings.Job(nil), e.settings.Jobs...)
+	for index := range copy.Jobs {
+		copy.Jobs[index].ExcludeNames = append([]string(nil), copy.Jobs[index].ExcludeNames...)
+	}
+	return copy
 }
 
 // ReloadSettings re-reads the stored document and returns it.
@@ -196,32 +226,108 @@ func (e *Engine) SaveSettings(ctx context.Context, next settings.Settings) error
 // changed so an operator's correction takes effect without a restart.
 func (e *Engine) applySettings(next settings.Settings) {
 	e.mu.Lock()
+	oldJobs := e.settings.Jobs
+	changedJobs := !reflect.DeepEqual(oldJobs, next.Jobs)
 	rebuild := e.cli == nil || e.settings.BinaryPath != next.BinaryPath
+	previousCLI := e.cli
 	e.settings = next
 	if rebuild {
 		e.cli = aliyunpan.New(e.aliyunpanDir(), next.BinaryPath)
 	}
+	if changedJobs {
+		stale := changedJobIDs(oldJobs, next.Jobs)
+		if len(stale) > 0 {
+			remaining := e.queue[:0]
+			for _, item := range e.queue {
+				if stale[item.JobID] && item.State != StateRunning && item.State != StateComplete {
+					continue
+				}
+				remaining = append(remaining, item)
+			}
+			if len(remaining) != len(e.queue) {
+				e.queue = remaining
+				e.markQueueDirtyLocked()
+			}
+		}
+	}
 	e.mu.Unlock()
+	if rebuild && previousCLI != nil {
+		// A path change invalidates an in-flight login/download on the old CLI;
+		// otherwise it can keep the old config or executable busy while the new
+		// CLI is already being used by the engine.
+		previousCLI.CancelLogin()
+		previousCLI.CancelRunning()
+	}
+	if rebuild {
+		e.invalidateProbe()
+		e.requestProbeRefresh()
+	}
+}
+
+func changedJobIDs(oldJobs, newJobs []settings.Job) map[string]bool {
+	oldByID := make(map[string]settings.Job, len(oldJobs))
+	for _, job := range oldJobs {
+		oldByID[job.ID] = job
+	}
+	changed := make(map[string]bool)
+	for _, job := range newJobs {
+		old, ok := oldByID[job.ID]
+		if !ok || !reflect.DeepEqual(old, job) {
+			changed[job.ID] = true
+		}
+		delete(oldByID, job.ID)
+	}
+	for id := range oldByID {
+		changed[id] = true
+	}
+	return changed
 }
 
 // Run drives the scheduler until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.mu.Lock()
+	e.runCtx = ctx
+	e.mu.Unlock()
+	defer func() {
+		if e.runDone != nil {
+			close(e.runDone)
+		}
+	}()
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	// Warm the account and binary probe before anyone opens the page, so the
 	// first render already knows whether the CLI is installed and linked
 	// rather than reporting "not installed" until its own refresh lands.
-	e.workers.Add(1)
-	go func() {
-		defer e.workers.Done()
-		e.refreshProbe(ctx)
-	}()
+	e.probeMu.Lock()
+	probeNeeded := !e.probes.refreshing
+	if probeNeeded {
+		e.probes.refreshing = true
+	}
+	e.probeMu.Unlock()
+	if probeNeeded {
+		if !e.launchProbe(ctx) {
+			e.probeMu.Lock()
+			e.probes.refreshing = false
+			e.probeMu.Unlock()
+		}
+	}
 	e.tick(ctx)
 	for {
 		select {
 		case <-ctx.Done():
+			e.mu.Lock()
+			e.stopping = true
+			e.mu.Unlock()
+			if cli := e.CLI(); cli != nil {
+				cli.CancelLogin()
+				cli.CancelRunning()
+			}
 			e.workers.Wait()
 			e.persistNow(context.WithoutCancel(ctx))
+			e.persistQuotaNow(context.WithoutCancel(ctx))
 			return
 		case <-ticker.C:
 			e.tick(ctx)
@@ -229,6 +335,34 @@ func (e *Engine) Run(ctx context.Context) {
 			e.tick(ctx)
 		}
 	}
+}
+
+// Wait lets the plugin host finish background work before it kills the child
+// process during a restart or shutdown.
+func (e *Engine) Wait(ctx context.Context) {
+	if e.runDone == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-e.runDone:
+	case <-ctx.Done():
+	}
+}
+
+// backgroundContext is cancelled with the plugin scheduler. Requests that
+// start scans, probes, or a binary installation are only acknowledgements;
+// their contexts must not cancel the work as soon as the HTTP response ends.
+func (e *Engine) backgroundContext() context.Context {
+	e.mu.Lock()
+	ctx := e.runCtx
+	e.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // Wake asks the scheduler to re-evaluate now rather than at the next tick.
@@ -255,6 +389,9 @@ func (e *Engine) Resume() {
 }
 
 func (e *Engine) tick(ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
 	e.reloadSettings(ctx)
 	e.rollQuota(ctx)
 	e.flushIfDue(ctx)
@@ -267,6 +404,9 @@ func (e *Engine) tick(ctx context.Context) {
 	e.mu.Unlock()
 
 	if paused {
+		return
+	}
+	if !e.accountReady() {
 		return
 	}
 	open := current.Schedule.Open(time.Now())
@@ -300,13 +440,11 @@ func (e *Engine) rollQuota(ctx context.Context) {
 	changed := e.quota.Day != day
 	if changed {
 		e.quota = QuotaState{Day: day}
+		e.markQuotaDirtyLocked()
 	}
-	quota := e.quota
 	e.mu.Unlock()
 	if changed {
-		if err := e.host.SetData(ctx, quotaKey, quota); err != nil {
-			e.logger.Printf("保存配额计数失败: %v", err)
-		}
+		e.persistQuotaNow(ctx)
 	}
 }
 
@@ -335,9 +473,11 @@ func (e *Engine) dispatch(ctx context.Context) {
 		e.workers.Add(1)
 		go func(item *Item) {
 			defer e.workers.Done()
-			e.transfer(ctx, item, limits)
+			wake := e.transfer(ctx, item, limits)
 			e.finishActive()
-			e.Wake()
+			if wake {
+				e.Wake()
+			}
 		}(item)
 	}
 }
@@ -371,7 +511,7 @@ func (e *Engine) takeNext(workers int) *Item {
 		item.resetSpeed()
 		e.active++
 		e.reserved += item.Size
-		e.dirty = true
+		e.markQueueDirtyLocked()
 		return item
 	}
 	return nil
@@ -413,20 +553,37 @@ func (e *Engine) releaseReservation(size int64) {
 	e.mu.Unlock()
 }
 
+func (e *Engine) markQueueDirtyLocked() {
+	e.queueRevision++
+	e.dirty = true
+}
+
+func (e *Engine) markQuotaDirtyLocked() {
+	e.quotaRevision++
+	e.quotaDirty = true
+}
+
 func (e *Engine) setStage(item *Item, stage Stage) {
 	e.mu.Lock()
 	item.Stage = stage
-	e.dirty = true
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 }
 
 func (e *Engine) noteDownload(item *Item, done int64) {
 	e.mu.Lock()
 	if done > item.Downloaded {
+		if item.Size >= 0 && done > item.Size {
+			done = item.Size
+		}
+		if done <= item.Downloaded {
+			e.mu.Unlock()
+			return
+		}
 		item.observe(done-item.Downloaded, time.Now())
 		item.Downloaded = done
+		e.markQueueDirtyLocked()
 	}
-	e.dirty = true
 	e.mu.Unlock()
 }
 
@@ -437,8 +594,12 @@ func (e *Engine) complete(ctx context.Context, item *Item) {
 	item.FinishedAt = nowMillis()
 	item.Error = ""
 	item.resetSpeed()
+	e.quota.UsedBytes += item.Size
+	e.markQueueDirtyLocked()
+	e.markQuotaDirtyLocked()
 	e.trimHistoryLocked()
 	e.mu.Unlock()
+	e.persistQuotaNow(ctx)
 	e.persistNow(ctx)
 }
 
@@ -450,6 +611,7 @@ func (e *Engine) fail(ctx context.Context, item *Item, err error) {
 	item.FinishedAt = nowMillis()
 	item.Error = err.Error()
 	item.resetSpeed()
+	e.markQueueDirtyLocked()
 	e.trimHistoryLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
@@ -483,23 +645,90 @@ func (e *Engine) trimHistoryLocked() {
 
 // persistNow writes the queue unconditionally.
 func (e *Engine) persistNow(ctx context.Context) {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
 	e.mu.Lock()
-	snapshot := append([]*Item(nil), e.queue...)
-	e.lastPersist = time.Now()
-	e.dirty = false
+	snapshot := cloneQueue(e.queue)
+	revision := e.queueRevision
 	e.mu.Unlock()
-	if err := e.host.SetData(ctx, queueKey, snapshot); err != nil {
+	writeCtx, cancel := persistContext(ctx)
+	defer cancel()
+	if err := e.host.SetData(writeCtx, queueKey, snapshot); err != nil {
 		e.logger.Printf("保存同步队列失败: %v", err)
+		return
 	}
+	e.mu.Lock()
+	if e.queueRevision == revision {
+		e.lastPersist = time.Now()
+		e.dirty = false
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) persistQuotaNow(ctx context.Context) {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	e.mu.Lock()
+	snapshot := e.quota
+	revision := e.quotaRevision
+	e.mu.Unlock()
+	writeCtx, cancel := persistContext(ctx)
+	defer cancel()
+	if err := e.host.SetData(writeCtx, quotaKey, snapshot); err != nil {
+		e.logger.Printf("保存配额计数失败: %v", err)
+		return
+	}
+	e.mu.Lock()
+	if e.quotaRevision == revision {
+		e.quotaDirty = false
+	}
+	e.mu.Unlock()
+}
+
+func cloneQueue(queue []*Item) []*Item {
+	cloned := make([]*Item, 0, len(queue))
+	for _, item := range queue {
+		if item == nil {
+			continue
+		}
+		copy := *item
+		cloned = append(cloned, &copy)
+	}
+	return cloned
+}
+
+func persistContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A scheduler shutdown passes an already detached context, so its final
+	// snapshot can outlive cancellation. An HTTP action, however, must retain
+	// its request deadline: otherwise the plugin RPC appears hung to the host
+	// while it continues persisting after the host has timed out the request.
+	if _, ok := ctx.Deadline(); ok {
+		return withTimeout(ctx, 30*time.Second)
+	}
+	return withTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
+func withTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // flushIfDue writes the queue if progress has moved since the last write.
 func (e *Engine) flushIfDue(ctx context.Context) {
 	e.mu.Lock()
 	due := e.dirty && time.Since(e.lastPersist) >= persistInterval
+	quotaDue := e.quotaDirty && time.Since(e.lastPersist) >= persistInterval
 	e.mu.Unlock()
 	if due {
 		e.persistNow(ctx)
+	}
+	if quotaDue {
+		e.persistQuotaNow(ctx)
 	}
 }
 
@@ -528,6 +757,7 @@ func (e *Engine) Retry(ctx context.Context, id string) error {
 	target.Uploaded = 0
 	target.UploadJobID = ""
 	target.FinishedAt = 0
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
 	e.Wake()
@@ -557,6 +787,7 @@ func (e *Engine) Cancel(ctx context.Context, id string) error {
 	target.State = StateCancelled
 	target.Stage = StageIdle
 	target.FinishedAt = nowMillis()
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
 	return nil
@@ -572,14 +803,19 @@ func (e *Engine) ClearFinished(ctx context.Context) {
 		}
 	}
 	e.queue = kept
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 	e.persistNow(ctx)
 }
 
 // stagedBytes is how much disk the staging area currently holds.
 func (e *Engine) stagedBytes() int64 {
+	return e.stagedBytesAt(e.StageDir())
+}
+
+func (e *Engine) stagedBytesAt(stageDir string) int64 {
 	var total int64
-	_ = filepath.WalkDir(e.StageDir(), func(path string, entry os.DirEntry, err error) error {
+	_ = filepath.WalkDir(stageDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
 			return nil //nolint:nilerr // an unreadable staging tree is reported by the transfer itself
 		}
@@ -601,4 +837,48 @@ func (e *Engine) stageLimit(limits hostapi.RuntimeSettings) int64 {
 		return configured
 	}
 	return limits.CacheLimit
+}
+
+func (e *Engine) reserveStageRoom(size int64, stageDir string, limits hostapi.RuntimeSettings) (func(), error) {
+	if size < 0 {
+		return nil, fmt.Errorf("文件大小不能为负数: %d", size)
+	}
+	limit := e.stageLimit(limits)
+	if limit <= 0 {
+		return func() {}, nil
+	}
+	used := e.stagedBytesAt(stageDir)
+	e.mu.Lock()
+	reserved := e.stageReserved
+	if used+reserved+size > limit && used+reserved > 0 {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("%w：已占用 %d 字节，上限 %d 字节，本文件 %d 字节；等待其它文件完成后重试",
+			ErrStageRoom, used+reserved, limit, size)
+	}
+	e.stageReserved += size
+	e.mu.Unlock()
+
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		e.mu.Lock()
+		e.stageReserved -= size
+		if e.stageReserved < 0 {
+			e.stageReserved = 0
+		}
+		e.mu.Unlock()
+	}, nil
+}
+
+// checkStageRoom keeps the old inspection-only helper for callers and tests;
+// transfers use reserveStageRoom so concurrent downloads also reserve space.
+func (e *Engine) checkStageRoom(item *Item, stageDir string, limits hostapi.RuntimeSettings) error {
+	release, err := e.reserveStageRoom(item.Size, stageDir, limits)
+	if release != nil {
+		release()
+	}
+	return err
 }

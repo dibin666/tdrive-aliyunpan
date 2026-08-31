@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,11 +77,23 @@ func TestPluginServesOverRPC(t *testing.T) {
 		t.Skip("builds the plugin binary")
 	}
 	binary := buildPlugin(t)
+	dataDir := filepath.Join(t.TempDir(), "persistent-plugin-data")
+	command := exec.Command(binary)
+	command.Env = make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(key, pluginDataDirEnv) {
+			continue
+		}
+		command.Env = append(command.Env, entry)
+	}
+	command.Env = append(command.Env, pluginDataDirEnv+"="+dataDir)
 
 	process := goPlugin.NewClient(&goPlugin.ClientConfig{
 		HandshakeConfig: tdriveplugin.HandshakeConfig,
 		Plugins:         goPlugin.PluginSet{tdriveplugin.PluginName: &tdriveplugin.RPCPlugin{}},
-		Cmd:             exec.Command(binary),
+		Cmd:             command,
+		SkipHostEnv:     true,
 		Logger:          hclog.NewNullLogger(),
 	})
 	defer process.Kill()
@@ -145,6 +159,13 @@ func TestPluginServesOverRPC(t *testing.T) {
 	if snapshot.Status == "" {
 		t.Error("the snapshot carries no status line")
 	}
+	name := "aliyunpan"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if snapshotPath := decodeBinaryPath(t, state.Body); snapshotPath != filepath.Join(dataDir, "aliyunpan", "bin", name) {
+		t.Errorf("plugin binary data path = %q, want path under host data dir", snapshotPath)
+	}
 
 	// An ordinary account must not reach the API even though tdrive has
 	// already established that it is signed in.
@@ -161,6 +182,19 @@ func TestPluginServesOverRPC(t *testing.T) {
 	if err := client.Shutdown(ctx); err != nil {
 		t.Errorf("shutdown: %v", err)
 	}
+}
+
+func decodeBinaryPath(t *testing.T, body []byte) string {
+	t.Helper()
+	var payload struct {
+		Binary struct {
+			Path string `json:"path"`
+		} `json:"binary"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode state for binary path: %v", err)
+	}
+	return payload.Binary.Path
 }
 
 func buildPlugin(t *testing.T) string {

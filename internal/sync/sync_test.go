@@ -1,13 +1,20 @@
 package sync
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
+	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
+	tdriveplugin "github.com/dibin/tdrive/pkg/plugin"
 )
 
 // The drive refuses an incomplete upload by formatting the pending indices
@@ -56,6 +63,55 @@ func TestMapPath(t *testing.T) {
 	}
 }
 
+func TestMapPathDoesNotTrimACommonPrefix(t *testing.T) {
+	got := mapPath("/a", "/target", "/ab/file.bin")
+	if got != "/target/ab/file.bin" {
+		t.Errorf("mapPath = %q, want %q", got, "/target/ab/file.bin")
+	}
+}
+
+func TestItemKeyIncludesSizeWhenHashIsMissing(t *testing.T) {
+	first := &Item{JobID: "j1", RemotePath: "/a/file.bin", Size: 10}
+	second := &Item{JobID: "j1", RemotePath: "/a/file.bin", Size: 11}
+	if first.key() == second.key() {
+		t.Fatal("items with changed sizes and no SHA1 must have different keys")
+	}
+}
+
+func TestConsiderIgnoresResultsFromAnEditedJob(t *testing.T) {
+	engine := &Engine{
+		settings: settings.Settings{Jobs: []settings.Job{{
+			ID: "j1", Name: "new", DriveName: settings.DefaultDriveName,
+			RemotePath: "/new", TargetPath: "/target",
+		}}},
+	}
+	oldJob := settings.Job{
+		ID: "j1", Name: "old", DriveName: settings.DefaultDriveName,
+		RemotePath: "/old", TargetPath: "/target",
+	}
+	engine.consider(oldJob, aliyunpan.Entry{
+		Name: "file.bin", Path: "/old/file.bin", Size: 1,
+	}, "/target", map[string]tdriveplugin.Entry{})
+	if len(engine.queue) != 0 {
+		t.Fatal("a scan using an old job snapshot queued stale work")
+	}
+}
+
+func TestSettingsReturnsAnIndependentJobSlice(t *testing.T) {
+	engine := &Engine{settings: settings.Settings{Jobs: []settings.Job{{
+		ID: "j1", RemotePath: "/a", TargetPath: "/b", ExcludeNames: []string{"old"},
+	}}}}
+	copy := engine.Settings()
+	copy.Jobs[0].Name = "changed"
+	copy.Jobs[0].ExcludeNames[0] = "changed"
+	if got := engine.settings.Jobs[0].Name; got == "changed" {
+		t.Fatal("Settings exposed the engine's job slice")
+	}
+	if got := engine.settings.Jobs[0].ExcludeNames[0]; got == "changed" {
+		t.Fatal("Settings exposed the engine's exclude slice")
+	}
+}
+
 func TestUnstorableName(t *testing.T) {
 	if reason := unstorableName("普通文件.mkv"); reason != "" {
 		t.Errorf("a normal name was rejected: %s", reason)
@@ -69,6 +125,11 @@ func TestUnstorableName(t *testing.T) {
 	}
 	if unstorableName("bad\x01name") == "" {
 		t.Error("a control character should be rejected")
+	}
+	for _, name := range []string{"CON.txt", "bad?name", "trailing."} {
+		if unstorableName(name) == "" {
+			t.Errorf("unsafe Windows name %q should be rejected", name)
+		}
 	}
 }
 
@@ -125,6 +186,84 @@ func TestItemTargetPath(t *testing.T) {
 	}
 	if got := (&Item{TargetDir: "/影视", Name: "a.mkv"}).TargetPath(); got != "/影视/a.mkv" {
 		t.Errorf("nested target = %q", got)
+	}
+}
+
+func TestItemStageDirIsUniquePerQueueItem(t *testing.T) {
+	first := itemStageDir("/stage", "item-a")
+	second := itemStageDir("/stage", "item-b")
+	if first == second {
+		t.Fatal("different queue items must not share a staging directory")
+	}
+	if first != "/stage/"+stageItemsDir+"/item-a" {
+		t.Fatalf("item stage directory = %q", first)
+	}
+}
+
+func TestCancelledTransferIsRequeuedFromUpload(t *testing.T) {
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{})}
+	item := &Item{
+		State:       StateRunning,
+		Stage:       StageUploading,
+		Downloaded:  20,
+		Uploaded:    10,
+		UploadJobID: "upload-1",
+		Error:       "old error",
+		FinishedAt:  123,
+	}
+
+	engine.deferUntilRetry(context.Background(), item, context.Canceled)
+
+	if item.State != StatePending || item.Stage != StageIdle {
+		t.Fatalf("cancelled item state = %s/%s, want pending/idle", item.State, item.Stage)
+	}
+	if item.Downloaded != 0 || item.Uploaded != 0 || item.UploadJobID != "" || item.FinishedAt != 0 {
+		t.Fatalf("cancelled item retained transfer state: %+v", item)
+	}
+}
+
+type zeroSegmentHost struct {
+	size int64
+}
+
+func (host *zeroSegmentHost) Call(context.Context, string, any, any) error { return nil }
+
+func (host *zeroSegmentHost) OpenStream(_ context.Context, method string, request any) (io.ReadWriteCloser, error) {
+	if method != "files.putSegment" {
+		return nil, fmt.Errorf("unexpected stream method %q", method)
+	}
+	payload, ok := request.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("unexpected stream request %T", request)
+	}
+	size, ok := payload["size"].(int64)
+	if !ok {
+		return nil, fmt.Errorf("unexpected stream size %T", payload["size"])
+	}
+	host.size = size
+	return nopReadWriteCloser{Buffer: bytes.NewBuffer(nil)}, nil
+}
+
+type nopReadWriteCloser struct{ *bytes.Buffer }
+
+func (nopReadWriteCloser) Close() error { return nil }
+
+func TestSendSegmentsCreatesZeroByteFileRecord(t *testing.T) {
+	host := &zeroSegmentHost{}
+	file, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer file.Close()
+	engine := &Engine{host: hostapi.New(host)}
+	item := &Item{Size: 0}
+	job := tdriveplugin.UploadJob{ID: "job", SegmentSize: 1, SegmentCount: 1}
+
+	if err := engine.sendSegments(context.Background(), item, file, job, []int{1}); err != nil {
+		t.Fatalf("sendSegments: %v", err)
+	}
+	if host.size != 0 {
+		t.Fatalf("zero-byte segment size = %d, want 0", host.size)
 	}
 }
 

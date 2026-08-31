@@ -9,9 +9,14 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 	syncengine "github.com/dibin/tdrive-aliyunpan/internal/sync"
@@ -42,7 +47,7 @@ func (p *plugin) Manifest() tdriveplugin.Manifest {
 	return tdriveplugin.Manifest{
 		ID:               pluginID,
 		Name:             "阿里云盘同步",
-		Description:      "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额。",
+		Description:      "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额；每个任务可选择备份盘或资源库。",
 		Version:          version,
 		SDKVersion:       "0.1",
 		APIVersion:       tdriveplugin.APIVersion,
@@ -65,8 +70,26 @@ func (p *plugin) Manifest() tdriveplugin.Manifest {
 // the host's initialization context is finished as soon as this returns, and
 // the engine has to outlive it.
 func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
+	if p.logger == nil {
+		p.logger = log.New(io.Discard, "", 0)
+	}
 	client := hostapi.New(host)
-	p.engine = syncengine.New(client, dataDir(), p.logger)
+	storageDir := dataDir()
+	legacyDir := legacyDataDir()
+	if err := migrateLegacyDataDir(storageDir, legacyDir); err != nil {
+		// The host's plugin-data directory is the canonical location. Migration
+		// is best effort so an old, otherwise healthy installation still gets a
+		// usable config page if a filesystem policy prevents moving a leftover.
+		p.logger.Printf("迁移旧 aliyunpan 数据目录失败（将继续使用新目录）: %v", err)
+		if !hasManagedBinary(storageDir) && hasManagedBinary(legacyDir) {
+			// A read-only or cross-device legacy tree is still better than
+			// forcing a multi-megabyte re-download. It will be retried on the
+			// next start after the filesystem becomes writable.
+			storageDir = legacyDir
+			p.logger.Printf("改用旧 aliyunpan 数据目录以保留已有二进制: %s", storageDir)
+		}
+	}
+	p.engine = syncengine.New(client, storageDir, p.logger)
 	if err := p.engine.Load(ctx); err != nil {
 		return err
 	}
@@ -75,7 +98,7 @@ func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	p.cancel = cancel
 	go p.engine.Run(runCtx)
-	p.logger.Printf("阿里云盘同步插件已启动，数据目录 %s", dataDir())
+	p.logger.Printf("阿里云盘同步插件已启动，数据目录 %s", storageDir)
 	return nil
 }
 
@@ -87,22 +110,207 @@ func (p *plugin) Shutdown(context.Context) error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	if p.engine != nil {
+		// The host kills the child immediately after this RPC returns. Give the
+		// scheduler time to cancel transfers and persist the final queue rather
+		// than returning while those goroutines are still writing state.
+		waitCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		p.engine.Wait(waitCtx)
+	}
 	return nil
 }
 
-// dataDir is the directory this plugin may write to.
-//
-// tdrive installs a plugin binary under its plugin directory and launches it
-// with the host's environment, so the executable's own location identifies a
-// directory that already belongs to this deployment. Deriving it that way
-// avoids inventing a configuration value for something the host has already
-// decided.
+const pluginDataDirEnv = "TDRIVE_PLUGIN_DATA_DIR"
+
+// dataDir is the directory this plugin may write to. The host supplies an
+// absolute path under its persistent data volume. The executable-relative
+// path remains as a compatibility fallback for standalone launches and older
+// hosts that do not know this environment variable yet.
 func dataDir() string {
+	if configured := strings.TrimSpace(os.Getenv(pluginDataDirEnv)); configured != "" {
+		if absolute, err := filepath.Abs(configured); err == nil {
+			return filepath.Clean(absolute)
+		}
+		return filepath.Clean(configured)
+	}
+	return legacyDataDir()
+}
+
+func legacyDataDir() string {
 	executable, err := os.Executable()
 	if err != nil {
 		return filepath.Join(os.TempDir(), "tdrive-"+pluginID)
 	}
 	return filepath.Join(filepath.Dir(executable), pluginID+"-data")
+}
+
+func hasManagedBinary(dir string) bool {
+	name := "aliyunpan"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	info, err := os.Stat(filepath.Join(dir, "bin", name))
+	return err == nil && !info.IsDir()
+}
+
+// migrateLegacyDataDir moves the data created by releases that derived their
+// location from the executable into the host-owned path. It never replaces an
+// existing destination entry: a partially migrated or newer destination wins,
+// while missing files are moved across one by one. If the two directories are
+// on different filesystems, moveEntry falls back to copy-then-remove.
+func migrateLegacyDataDir(destination, legacy string) error {
+	destination = filepath.Clean(destination)
+	legacy = filepath.Clean(legacy)
+	if samePath(destination, legacy) {
+		return nil
+	}
+	legacyInfo, err := os.Stat(legacy)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !legacyInfo.IsDir() {
+		return fmt.Errorf("旧数据路径不是目录: %s", legacy)
+	}
+
+	destinationInfo, err := os.Stat(destination)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(destination), 0o750); err != nil {
+			return err
+		}
+		if err := os.Rename(legacy, destination); err == nil {
+			return nil
+		}
+		if err := os.MkdirAll(destination, 0o750); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if !destinationInfo.IsDir() {
+		return fmt.Errorf("新数据路径不是目录: %s", destination)
+	}
+
+	return mergeDataDir(legacy, destination)
+}
+
+func mergeDataDir(source, destination string) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, entry := range entries {
+		from := filepath.Join(source, entry.Name())
+		to := filepath.Join(destination, entry.Name())
+		_, statErr := os.Lstat(to)
+		if os.IsNotExist(statErr) {
+			if err := moveEntry(from, to); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if statErr != nil {
+			if firstErr == nil {
+				firstErr = statErr
+			}
+			continue
+		}
+		if entry.IsDir() {
+			info, err := os.Stat(to)
+			if err != nil || !info.IsDir() {
+				if firstErr == nil {
+					if err != nil {
+						firstErr = err
+					} else {
+						firstErr = fmt.Errorf("数据目标不是目录: %s", to)
+					}
+				}
+				continue
+			}
+			if err := mergeDataDir(from, to); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		// If the destination already contains this entry, retain the legacy
+		// copy. It is safer to leave a duplicate than to delete data we did not
+		// prove was identical.
+	}
+	return firstErr
+}
+
+func moveEntry(source, destination string) error {
+	if err := os.Rename(source, destination); err == nil {
+		return nil
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(destination, info.Mode().Perm()); err != nil {
+			return err
+		}
+		if err := mergeDataDir(source, destination); err != nil {
+			return err
+		}
+		return os.Remove(source)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("不支持迁移特殊文件: %s", source)
+	}
+
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".aliyunpan-migrate-*")
+	if err != nil {
+		input.Close()
+		return err
+	}
+	temporaryName := temporary.Name()
+	cleanup := func() {
+		input.Close()
+		temporary.Close()
+		_ = os.Remove(temporaryName)
+	}
+	if _, err := io.Copy(temporary, input); err != nil {
+		cleanup()
+		return err
+	}
+	if err := input.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(temporaryName, destination); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Remove(source); err != nil {
+		return err
+	}
+	return nil
+}
+
+func samePath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr == nil && rightErr == nil {
+		left, right = leftAbs, rightAbs
+	}
+	rel, err := filepath.Rel(filepath.Clean(left), filepath.Clean(right))
+	return err == nil && rel == "."
 }
 
 func main() {

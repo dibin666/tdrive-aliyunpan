@@ -94,7 +94,10 @@ func (client *Client) AttachHost(ctx context.Context, host Host) error {
 
 	go client.broker.AcceptAndServe(brokerID, &HostRPCServer{Host: host, broker: client.broker})
 	var response struct{}
-	if err := client.call(ctx, "Plugin.Initialize", InitializeArgs{HostBrokerID: brokerID}, &response); err != nil {
+	if err := client.call(ctx, "Plugin.Initialize", InitializeArgs{
+		HostBrokerID:      brokerID,
+		DeadlineUnixMilli: deadlineUnixMilli(ctx),
+	}, &response); err != nil {
 		client.mu.Lock()
 		client.hostAttached = false
 		client.mu.Unlock()
@@ -106,6 +109,7 @@ func (client *Client) AttachHost(ctx context.Context, host Host) error {
 // Before sends an operation to the optional plugin hook.
 func (client *Client) Before(ctx context.Context, operation Operation) (OperationResult, error) {
 	var response OperationResult
+	operation.DeadlineUnixMilli = deadlineUnixMilli(ctx)
 	if err := client.call(ctx, "Plugin.Before", operation, &response); err != nil {
 		return OperationResult{}, err
 	}
@@ -115,18 +119,21 @@ func (client *Client) Before(ctx context.Context, operation Operation) (Operatio
 // After sends an operation to the optional post-operation hook.
 func (client *Client) After(ctx context.Context, operation Operation) error {
 	var response struct{}
+	operation.DeadlineUnixMilli = deadlineUnixMilli(ctx)
 	return client.call(ctx, "Plugin.After", operation, &response)
 }
 
 // OnEvent delivers one event to the plugin.
 func (client *Client) OnEvent(ctx context.Context, event Event) error {
 	var response struct{}
+	event.DeadlineUnixMilli = deadlineUnixMilli(ctx)
 	return client.call(ctx, "Plugin.OnEvent", event, &response)
 }
 
 // HandleHTTP calls a plugin-owned HTTP route.
 func (client *Client) HandleHTTP(ctx context.Context, request HTTPRequest) (HTTPResponse, error) {
 	var response HTTPResponse
+	request.DeadlineUnixMilli = deadlineUnixMilli(ctx)
 	if err := client.call(ctx, "Plugin.HandleHTTP", request, &response); err != nil {
 		return HTTPResponse{}, err
 	}
@@ -137,7 +144,7 @@ func (client *Client) HandleHTTP(ctx context.Context, request HTTPRequest) (HTTP
 // kills the child process.
 func (client *Client) Shutdown(ctx context.Context) error {
 	var response struct{}
-	return client.call(ctx, "Plugin.Shutdown", struct{}{}, &response)
+	return client.call(ctx, "Plugin.Shutdown", ShutdownArgs{DeadlineUnixMilli: deadlineUnixMilli(ctx)}, &response)
 }
 
 func (client *Client) call(ctx context.Context, method string, args, response any) error {
@@ -155,7 +162,12 @@ func (client *Client) call(ctx context.Context, method string, args, response an
 
 // InitializeArgs contains the broker ID the plugin uses to reach the host.
 type InitializeArgs struct {
-	HostBrokerID uint32
+	HostBrokerID      uint32
+	DeadlineUnixMilli int64
+}
+
+type ShutdownArgs struct {
+	DeadlineUnixMilli int64
 }
 
 // RPCServer is the plugin-side net/rpc implementation.
@@ -190,7 +202,9 @@ func (server *RPCServer) Initialize(args InitializeArgs, _ *struct{}) error {
 		return fmt.Errorf("connect to tdrive host: %w", err)
 	}
 	hostClient := &HostClient{rpc: rpc.NewClient(connection), broker: server.broker}
-	if err := server.Impl.Initialize(context.Background(), hostClient); err != nil {
+	callCtx, cancel := contextWithDeadline(args.DeadlineUnixMilli)
+	defer cancel()
+	if err := server.Impl.Initialize(callCtx, hostClient); err != nil {
 		_ = connection.Close()
 		return err
 	}
@@ -208,7 +222,9 @@ func (server *RPCServer) Before(operation Operation, response *OperationResult) 
 		*response = OperationResult{Allowed: true, Payload: operation.Payload}
 		return nil
 	}
-	result, err := hook.Before(context.Background(), operation)
+	callCtx, cancel := contextWithDeadline(operation.DeadlineUnixMilli)
+	defer cancel()
+	result, err := hook.Before(callCtx, operation)
 	if err != nil {
 		return err
 	}
@@ -218,14 +234,18 @@ func (server *RPCServer) Before(operation Operation, response *OperationResult) 
 
 func (server *RPCServer) After(operation Operation, _ *struct{}) error {
 	if hook, ok := server.Impl.(AfterHook); ok {
-		hook.After(context.Background(), operation)
+		callCtx, cancel := contextWithDeadline(operation.DeadlineUnixMilli)
+		defer cancel()
+		hook.After(callCtx, operation)
 	}
 	return nil
 }
 
 func (server *RPCServer) OnEvent(event Event, _ *struct{}) error {
 	if hook, ok := server.Impl.(EventHook); ok {
-		hook.OnEvent(context.Background(), event)
+		callCtx, cancel := contextWithDeadline(event.DeadlineUnixMilli)
+		defer cancel()
+		hook.OnEvent(callCtx, event)
 	}
 	return nil
 }
@@ -235,7 +255,9 @@ func (server *RPCServer) HandleHTTP(request HTTPRequest, response *HTTPResponse)
 	if !ok {
 		return errors.New("plugin does not implement HTTP routes")
 	}
-	result, err := hook.HandleHTTP(context.Background(), request)
+	callCtx, cancel := contextWithDeadline(request.DeadlineUnixMilli)
+	defer cancel()
+	result, err := hook.HandleHTTP(callCtx, request)
 	if err != nil {
 		return err
 	}
@@ -246,10 +268,12 @@ func (server *RPCServer) HandleHTTP(request HTTPRequest, response *HTTPResponse)
 	return nil
 }
 
-func (server *RPCServer) Shutdown(_ struct{}, _ *struct{}) error {
+func (server *RPCServer) Shutdown(args ShutdownArgs, _ *struct{}) error {
 	var shutdownErr error
 	if hook, ok := server.Impl.(ShutdownHook); ok {
-		shutdownErr = hook.Shutdown(context.Background())
+		callCtx, cancel := contextWithDeadline(args.DeadlineUnixMilli)
+		defer cancel()
+		shutdownErr = hook.Shutdown(callCtx)
 	}
 	server.mu.Lock()
 	if server.hostConn != nil {
@@ -273,7 +297,11 @@ func (client *HostClient) Call(ctx context.Context, method string, request any, 
 		return fmt.Errorf("encode host request: %w", err)
 	}
 	var result HostCallResponse
-	if err := client.call(ctx, "Plugin.Call", HostCallRequest{Method: method, Payload: payload}, &result); err != nil {
+	if err := client.call(ctx, "Plugin.Call", HostCallRequest{
+		Method:            method,
+		Payload:           payload,
+		DeadlineUnixMilli: deadlineUnixMilli(ctx),
+	}, &result); err != nil {
 		return err
 	}
 	if result.Error != "" {
@@ -296,9 +324,10 @@ func (client *HostClient) OpenStream(ctx context.Context, method string, request
 	brokerID := client.broker.NextId()
 	var response struct{}
 	if err := client.call(ctx, "Plugin.OpenStream", HostStreamRequest{
-		BrokerID: brokerID,
-		Method:   method,
-		Payload:  payload,
+		BrokerID:          brokerID,
+		Method:            method,
+		Payload:           payload,
+		DeadlineUnixMilli: deadlineUnixMilli(ctx),
 	}, &response); err != nil {
 		return nil, err
 	}
@@ -324,8 +353,9 @@ func (client *HostClient) call(ctx context.Context, method string, args, respons
 
 // HostCallRequest and HostCallResponse are the raw reverse-RPC envelope.
 type HostCallRequest struct {
-	Method  string
-	Payload []byte
+	Method            string
+	Payload           []byte
+	DeadlineUnixMilli int64
 }
 
 type HostCallResponse struct {
@@ -335,9 +365,10 @@ type HostCallResponse struct {
 
 // HostStreamRequest asks the host to broker an io.ReadWriteCloser.
 type HostStreamRequest struct {
-	BrokerID uint32
-	Method   string
-	Payload  []byte
+	BrokerID          uint32
+	Method            string
+	Payload           []byte
+	DeadlineUnixMilli int64
 }
 
 // HostRPCServer runs in the tdrive process and forwards calls to the concrete
@@ -348,8 +379,10 @@ type HostRPCServer struct {
 }
 
 func (server *HostRPCServer) Call(request HostCallRequest, response *HostCallResponse) error {
+	callCtx, cancel := contextWithDeadline(request.DeadlineUnixMilli)
+	defer cancel()
 	var payload json.RawMessage
-	if err := server.Host.Call(context.Background(), request.Method, json.RawMessage(request.Payload), &payload); err != nil {
+	if err := server.Host.Call(callCtx, request.Method, json.RawMessage(request.Payload), &payload); err != nil {
 		response.Error = err.Error()
 		return nil
 	}
@@ -358,7 +391,9 @@ func (server *HostRPCServer) Call(request HostCallRequest, response *HostCallRes
 }
 
 func (server *HostRPCServer) OpenStream(request HostStreamRequest, _ *struct{}) error {
+	callCtx, cancel := contextWithDeadline(request.DeadlineUnixMilli)
 	go func() {
+		defer cancel()
 		connection, err := server.broker.Accept(request.BrokerID)
 		if err != nil {
 			return
@@ -366,7 +401,7 @@ func (server *HostRPCServer) OpenStream(request HostStreamRequest, _ *struct{}) 
 		defer connection.Close()
 
 		stream, err := server.Host.OpenStream(
-			context.Background(),
+			callCtx,
 			request.Method,
 			json.RawMessage(request.Payload),
 		)

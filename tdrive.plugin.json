@@ -1,7 +1,7 @@
 {
   "id": "aliyunpan",
   "name": "阿里云盘同步",
-  "description": "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额。",
+  "description": "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额；每个任务可选择备份盘或资源库。",
   "version": "0.0.0",
   "sdkVersion": "0.1",
   "apiVersion": 1,
