@@ -41,6 +41,9 @@ type Item struct {
 	DriveName string `json:"driveName,omitempty"`
 
 	RemotePath string `json:"remotePath"`
+	// FileID is populated by the source API scanner. It is optional for queue
+	// records written by the old CLI integration, which fall back to the path.
+	FileID     string `json:"fileId,omitempty"`
 	TargetDir  string `json:"targetDir"`
 	Name       string `json:"name"`
 	Size       int64  `json:"size"`

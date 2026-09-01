@@ -1,3 +1,5 @@
+//go:build legacycli
+
 package aliyunpan
 
 import (

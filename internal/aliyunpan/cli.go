@@ -1,3 +1,5 @@
+//go:build legacycli
+
 // Package aliyunpan drives the upstream aliyunpan command line tool.
 //
 // The plugin shells out rather than reimplementing the Aliyun Drive API: the

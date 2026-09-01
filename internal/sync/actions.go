@@ -10,71 +10,11 @@ import (
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
 )
 
-// InstallBinary downloads the pinned aliyunpan release in the background.
-//
-// It cannot run inside the request that triggered it: the host gives a plugin
-// HTTP route thirty seconds, and the archive is large enough that a modest
-// link needs longer. The 账号 tab polls Snapshot.Installing instead.
+// InstallBinary is retained as a compatibility endpoint for older pages. The
+// source client is part of this plugin and no executable needs to be installed.
 func (e *Engine) InstallBinary(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cli := e.CLI()
-	if cli == nil {
-		return errors.New("aliyunpan 尚未配置")
-	}
-	if !cli.Managed() {
-		return errors.New("配置里指定了自定义 aliyunpan 路径，插件不会覆盖它")
-	}
-	e.mu.Lock()
-	stopping := e.stopping
-	e.mu.Unlock()
-	if stopping {
-		return errors.New("插件正在停止")
-	}
-
-	e.probeMu.Lock()
-	if e.installing {
-		e.probeMu.Unlock()
-		return errors.New("已经在下载了")
-	}
-	e.installing = true
-	e.installError = ""
-	e.probeMu.Unlock()
-	e.mu.Lock()
-	if e.stopping {
-		e.mu.Unlock()
-		e.probeMu.Lock()
-		e.installing = false
-		e.probeMu.Unlock()
-		return errors.New("插件正在停止")
-	}
-	e.workers.Add(1)
-	e.mu.Unlock()
-
-	background := e.backgroundContext()
-	go func() {
-		defer e.workers.Done()
-		err := cli.InstallManaged(background)
-
-		e.probeMu.Lock()
-		e.installing = false
-		if err != nil {
-			e.installError = err.Error()
-		}
-		e.probeMu.Unlock()
-		// Force the next probe to re-read the binary rather than serve the
-		// pre-install cache.
-		e.invalidateProbe()
-
-		if err != nil {
-			e.logger.Printf("下载 aliyunpan 失败: %v", err)
-			return
-		}
-		e.requestProbeRefresh()
-		e.Wake()
-	}()
-	return nil
+	_ = ctx
+	return errors.New("aliyunpan 已内置源码客户端，无需安装二进制")
 }
 
 // StartLogin begins the interactive scan-code login.
@@ -86,8 +26,8 @@ func (e *Engine) StartLogin(ctx context.Context) (aliyunpan.LoginState, error) {
 	return cli.StartLogin(ctx)
 }
 
-// ConfirmLogin tells the CLI the browser step is done and waits briefly for
-// the token exchange so the caller's next poll already has the outcome.
+// ConfirmLogin completes the browser step and waits briefly for the token
+// exchange so the caller's next poll already has the outcome.
 func (e *Engine) ConfirmLogin(ctx context.Context) (aliyunpan.LoginState, error) {
 	cli := e.CLI()
 	if cli == nil {
@@ -115,6 +55,7 @@ func (e *Engine) Logout(ctx context.Context) error {
 	if cli == nil {
 		return errors.New("aliyunpan 尚未配置")
 	}
+	e.cancelRunningTransfers(ctx)
 	e.invalidateProbe()
 	err := cli.Logout(ctx)
 	// A probe can have completed its `who` call just before Logout cancelled
@@ -124,6 +65,22 @@ func (e *Engine) Logout(ctx context.Context) error {
 	e.requestProbeRefresh()
 	e.Wake()
 	return err
+}
+
+func (e *Engine) cancelRunningTransfers(ctx context.Context) {
+	e.mu.Lock()
+	runningIDs := make([]string, 0, e.active)
+	for _, item := range e.queue {
+		if item.State == StateRunning {
+			runningIDs = append(runningIDs, item.ID)
+		}
+	}
+	e.mu.Unlock()
+	if len(runningIDs) > 0 {
+		if err := e.Cancel(ctx, runningIDs...); err != nil {
+			e.logger.Printf("退出阿里云盘前取消传输失败: %v", err)
+		}
+	}
 }
 
 // Browse lists a cloud directory for the target picker.
@@ -197,7 +154,7 @@ func (e *Engine) UpsertJob(ctx context.Context, job settings.Job) error {
 		e.StartScan(ctx)
 	} else {
 		// The startup probe or a login completion will wake the scheduler once
-		// there is an account to scan. Starting a CLI process before that only
+		// there is an account to scan. Starting a source request before that only
 		// creates noisy failed scans.
 		e.Wake()
 	}

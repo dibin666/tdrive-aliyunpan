@@ -686,7 +686,6 @@
           snapshot &&
           (snapshot.summary.active > 0 ||
             snapshot.scan.scanning ||
-            snapshot.installing ||
             (snapshot.login && snapshot.login.active))
         pollTimer = setTimeout(() => load(true), busy ? ACTIVE_POLL_INTERVAL : IDLE_POLL_INTERVAL)
       }
@@ -1077,9 +1076,8 @@
           '<div class="form">',
           field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage'),
           field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 的暂存上限'),
-          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '传给 aliyunpan 的 max_download_rate，留空表示不限速'),
+          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '源码客户端的总下载限速，留空表示不限速'),
           field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空使用第一个管理员" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归谁、占谁的配额'),
-          field('aliyunpan 路径', '<input class="input" id="binary-path" placeholder="留空使用插件下载的版本" value="' + esc((state.settings && state.settings.binaryPath) || '') + '">', '离线部署或自编译版本填这里'),
           '</div>',
           '</div>',
 
@@ -1118,30 +1116,17 @@
       }
 
       function accountView(snapshot) {
-        const binary = snapshot.binary
         const account = snapshot.account
         const login = snapshot.login
         return [
           '<div class="card">',
-          '<p class="section-title">aliyunpan 命令行</p>',
+          '<p class="section-title">阿里云盘源码客户端</p>',
           '<div class="stats">',
-          stat('状态', binary.installed ? '已安装' : '未安装'),
-          stat('版本', binary.version || '—'),
-          stat('来源', binary.managed ? '插件管理' : '自定义路径'),
+          stat('状态', '已内置'),
+          stat('接口', 'OpenAPI'),
+          stat('下载', '并行 Range'),
           '</div>',
-          '<div class="hint mono" style="margin-top:.5rem">' + esc(binary.path || '') + '</div>',
-          binary.error ? '<div class="error-box" style="margin-top:.5rem">' + esc(binary.error) + '</div>' : '',
-          snapshot.installError
-            ? '<div class="error-box" style="margin-top:.5rem">' + esc(snapshot.installError) + '</div>'
-            : '',
-          '<div class="toolbar" style="margin-top:.75rem">',
-          '<button class="btn btn-outline" id="install-btn" type="button"' +
-            (snapshot.installing || !binary.managed ? ' disabled' : '') +
-            '>' +
-            (snapshot.installing ? '正在下载…' : binary.installed ? '重新下载' : '下载 aliyunpan') +
-            '</button>',
-          binary.managed ? '' : '<span class="hint">配置里指定了自定义路径，插件不会覆盖它。</span>',
-          '</div>',
+          '<div class="hint" style="margin-top:.5rem">插件直接使用 Go 源码接入阿里云盘，不再下载、启动或依赖 aliyunpan 独立二进制。</div>',
           '</div>',
 
           '<div class="card">',
@@ -1158,16 +1143,13 @@
               '</div>' +
               '<div class="toolbar" style="margin-top:.75rem"><button class="btn btn-danger" id="logout-btn" type="button">退出登录</button>' +
               '<button class="btn btn-ghost" id="refresh-account" type="button">刷新</button></div>'
-            : loginPanel(login, binary),
+            : loginPanel(login),
           account.error ? '<div class="error-box" style="margin-top:.5rem">' + esc(account.error) + '</div>' : '',
           '</div>',
         ].join('')
       }
 
-      function loginPanel(login, binary) {
-        if (!binary.installed) {
-          return '<div class="hint">先下载 aliyunpan，再进行扫码登录。</div>'
-        }
+      function loginPanel(login) {
         if (login && login.active && login.url) {
           return [
             '<div class="hint">在浏览器里打开下面的链接完成授权和扫码，然后回到这里点「我已完成登录」。链接 5 分钟内有效',
@@ -1535,9 +1517,6 @@
           case 'save-plan':
             await savePlan()
             return
-          case 'install-btn':
-            await act('/binary/install', null, '开始下载 aliyunpan')
-            return
           case 'start-login':
             await act('/login/start', null, null)
             return
@@ -1560,7 +1539,12 @@
             await act('/logout', null, '已退出')
             return
           case 'refresh-account':
-            await act('/account', { method: 'GET' }, null)
+            try {
+              await call('/account')
+              await load(true)
+            } catch (error) {
+              toast(error.message, 'error')
+            }
             return
         }
 
@@ -1689,7 +1673,6 @@
         const stageGib = Number(value('stage-limit') || 0)
         const next = {
           ...state.settings,
-          binaryPath: value('binary-path'),
           stageDir: value('stage-dir'),
           stageLimitBytes: Math.round(stageGib * 1073741824),
           ownerUserId: value('owner'),

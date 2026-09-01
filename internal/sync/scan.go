@@ -335,6 +335,7 @@ func (e *Engine) consider(
 	candidate := &Item{
 		JobID:      job.ID,
 		RemotePath: entry.Path,
+		FileID:     entry.FileID,
 		Size:       entry.Size,
 		SHA1:       entry.SHA1,
 	}
@@ -356,6 +357,7 @@ func (e *Engine) consider(
 		JobName:     job.Name,
 		DriveName:   job.DriveName,
 		RemotePath:  entry.Path,
+		FileID:      entry.FileID,
 		TargetDir:   targetDir,
 		Name:        entry.Name,
 		Size:        entry.Size,

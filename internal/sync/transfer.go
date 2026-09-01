@@ -101,8 +101,19 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 			drive, resolveErr := cli.ResolveDrive(ctx, item.DriveName)
 			if resolveErr != nil {
 				e.logger.Printf("解析删除目标网盘失败: %v", resolveErr)
-			} else if err := cli.Remove(ctx, item.RemotePath, drive.ID); err != nil {
-				e.logger.Printf("删除云端 %s 失败: %v", item.RemotePath, err)
+			} else {
+				var removeErr error
+				if item.FileID != "" {
+					removeErr = cli.RemoveByID(ctx, drive.ID, item.FileID)
+					if errors.Is(removeErr, aliyunpan.ErrPathNotFound) {
+						removeErr = cli.Remove(ctx, item.RemotePath, drive.ID)
+					}
+				} else {
+					removeErr = cli.Remove(ctx, item.RemotePath, drive.ID)
+				}
+				if removeErr != nil {
+					e.logger.Printf("删除云端 %s 失败: %v", item.RemotePath, removeErr)
+				}
 			}
 		}
 	}
@@ -161,7 +172,7 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 	e.setStage(item, StageDownloading)
 	current := e.Settings()
 	if err := cli.SetDownloadRate(ctx, current.DownloadRate); err != nil {
-		e.logger.Printf("设置下载限速失败: %v", err)
+		return "", fmt.Errorf("设置下载限速: %w", err)
 	}
 
 	// The per-file connection count follows tdrive's own download setting so a
@@ -173,6 +184,7 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 	staged, err := cli.Download(ctx, aliyunpan.DownloadRequest{
 		CloudPath:     item.RemotePath,
 		StageDir:      downloadDir,
+		FileID:        item.FileID,
 		DriveID:       drive.ID,
 		SliceParallel: slices,
 	}, item.Size, func(done int64) { e.noteDownload(item, done) })

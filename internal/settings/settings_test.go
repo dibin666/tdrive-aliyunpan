@@ -129,7 +129,6 @@ func TestNormalizeJobDefaultsToBackupDrive(t *testing.T) {
 
 func TestNormalizeRejections(t *testing.T) {
 	cases := map[string]Settings{
-		"相对二进制路径":  {BinaryPath: "bin/aliyunpan"},
 		"相对暂存路径":   {StageDir: "stage"},
 		"负配额":      {Quota: Quota{DailyBytes: -1}},
 		"畸形时刻":     {Schedule: Schedule{WindowStart: "25:00"}},
@@ -146,6 +145,13 @@ func TestNormalizeRejections(t *testing.T) {
 		if err := document.Normalize(); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+func TestNormalizeAcceptsLegacyBinaryPath(t *testing.T) {
+	document := Settings{BinaryPath: "bin/aliyunpan"}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize rejected a legacy binaryPath: %v", err)
 	}
 }
 

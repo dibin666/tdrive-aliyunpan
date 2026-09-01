@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
 	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 	"github.com/dibin/tdrive-aliyunpan/internal/settings"
 	syncengine "github.com/dibin/tdrive-aliyunpan/internal/sync"
@@ -205,17 +206,16 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		if request.Method != http.MethodPost {
 			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
 		}
-		if err := s.engine.InstallBinary(ctx); err != nil {
-			return status(http.StatusBadRequest, err.Error()), nil
-		}
-		return okJSON(map[string]bool{"installing": true})
+		// Keep the route for older cached pages, but there is no external
+		// executable to download after the source-client migration.
+		return status(http.StatusGone, "aliyunpan 已内置源码客户端，无需安装二进制"), nil
 
 	case "/api/account":
 		if request.Method != http.MethodGet {
 			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
 		}
-		account, binary := s.engine.RefreshProbe(ctx)
-		return okJSON(map[string]any{"account": account, "binary": binary})
+		account := s.engine.RefreshProbe(ctx)
+		return okJSON(map[string]any{"account": account, "binary": aliyunpan.BuiltInBinaryState()})
 
 	case "/api/login/start":
 		if request.Method != http.MethodPost {

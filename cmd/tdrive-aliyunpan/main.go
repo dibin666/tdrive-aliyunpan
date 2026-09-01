@@ -1,10 +1,10 @@
 // Command tdrive-aliyunpan moves files from Aliyun Drive into tdrive.
 //
 // It is a tdrive plugin: a standalone binary the host launches and speaks to
-// over local RPC. Everything an administrator needs to do — installing the
-// aliyunpan CLI, linking the cloud account, defining what to sync, setting the
-// schedule and the daily Telegram budget, watching transfers — happens on the
-// page this plugin serves inside the tdrive web interface.
+// over local RPC. Everything an administrator needs to do — linking the cloud
+// account, defining what to sync, setting the schedule and the daily Telegram
+// budget, watching transfers — happens on the page this plugin serves inside
+// the tdrive web interface.
 package main
 
 import (
@@ -14,7 +14,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -47,7 +46,7 @@ func (p *plugin) Manifest() tdriveplugin.Manifest {
 	return tdriveplugin.Manifest{
 		ID:               pluginID,
 		Name:             "阿里云盘同步",
-		Description:      "按计划把阿里云盘的文件搬进 tdrive（Telegram）存储，遵循 tdrive 当前的传输限制并支持每日流量配额；每个任务可选择备份盘或资源库。",
+		Description:      "使用内置 Go/OpenAPI 客户端按计划把阿里云盘文件搬进 tdrive（Telegram），支持备份盘、资源库、并行下载和每日流量配额。",
 		Version:          version,
 		SDKVersion:       "0.1",
 		APIVersion:       tdriveplugin.APIVersion,
@@ -81,12 +80,12 @@ func (p *plugin) Initialize(ctx context.Context, host tdriveplugin.Host) error {
 		// is best effort so an old, otherwise healthy installation still gets a
 		// usable config page if a filesystem policy prevents moving a leftover.
 		p.logger.Printf("迁移旧 aliyunpan 数据目录失败（将继续使用新目录）: %v", err)
-		if !hasManagedBinary(storageDir) && hasManagedBinary(legacyDir) {
+		if !hasLegacyCredentials(storageDir) && hasLegacyCredentials(legacyDir) {
 			// A read-only or cross-device legacy tree is still better than
-			// forcing a multi-megabyte re-download. It will be retried on the
-			// next start after the filesystem becomes writable.
+			// forcing a re-login. It will be retried on the next start after the
+			// filesystem becomes writable.
 			storageDir = legacyDir
-			p.logger.Printf("改用旧 aliyunpan 数据目录以保留已有二进制: %s", storageDir)
+			p.logger.Printf("改用旧 aliyunpan 数据目录以保留已有登录凭证: %s", storageDir)
 		}
 	}
 	p.engine = syncengine.New(client, storageDir, p.logger)
@@ -145,12 +144,8 @@ func legacyDataDir() string {
 	return filepath.Join(filepath.Dir(executable), pluginID+"-data")
 }
 
-func hasManagedBinary(dir string) bool {
-	name := "aliyunpan"
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-	info, err := os.Stat(filepath.Join(dir, "bin", name))
+func hasLegacyCredentials(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "config", "aliyunpan_config.json"))
 	return err == nil && !info.IsDir()
 }
 

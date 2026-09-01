@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -152,6 +151,10 @@ func TestPluginServesOverRPC(t *testing.T) {
 	var snapshot struct {
 		Status string `json:"status"`
 		Rows   []any  `json:"rows"`
+		Binary struct {
+			Installed bool   `json:"installed"`
+			Path      string `json:"path"`
+		} `json:"binary"`
 	}
 	if err := json.Unmarshal(state.Body, &snapshot); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
@@ -159,14 +162,9 @@ func TestPluginServesOverRPC(t *testing.T) {
 	if snapshot.Status == "" {
 		t.Error("the snapshot carries no status line")
 	}
-	name := "aliyunpan"
-	if runtime.GOOS == "windows" {
-		name += ".exe"
+	if !snapshot.Binary.Installed || snapshot.Binary.Path != "内置源码客户端" {
+		t.Errorf("binary compatibility state = %+v, want built-in client", snapshot.Binary)
 	}
-	if snapshotPath := decodeBinaryPath(t, state.Body); snapshotPath != filepath.Join(dataDir, "aliyunpan", "bin", name) {
-		t.Errorf("plugin binary data path = %q, want path under host data dir", snapshotPath)
-	}
-
 	// An ordinary account must not reach the API even though tdrive has
 	// already established that it is signed in.
 	denied, err := client.HandleHTTP(ctx, tdriveplugin.HTTPRequest{
@@ -182,19 +180,6 @@ func TestPluginServesOverRPC(t *testing.T) {
 	if err := client.Shutdown(ctx); err != nil {
 		t.Errorf("shutdown: %v", err)
 	}
-}
-
-func decodeBinaryPath(t *testing.T, body []byte) string {
-	t.Helper()
-	var payload struct {
-		Binary struct {
-			Path string `json:"path"`
-		} `json:"binary"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("decode state for binary path: %v", err)
-	}
-	return payload.Binary.Path
 }
 
 func buildPlugin(t *testing.T) string {

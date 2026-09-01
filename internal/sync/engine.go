@@ -86,14 +86,11 @@ type Engine struct {
 	workers sync.WaitGroup
 	runDone chan struct{}
 
-	// probeMu guards the cached aliyunpan account and binary state. They are
-	// cached because both shell out and one of them makes a network call,
-	// which must not happen on the sync page's poll interval.
+	// probeMu guards the cached aliyunpan account. It is cached because the
+	// source client makes a network call, which must not happen on every page
+	// poll.
 	probeMu sync.Mutex
 	probes  probeCache
-	// installing and installError report the background binary download.
-	installing   bool
-	installError string
 }
 
 // New builds an engine. It does not touch the host; call Load first.
@@ -114,7 +111,7 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 	}
 }
 
-// CLI exposes the aliyunpan wrapper to the HTTP layer, which needs it for the
+// CLI exposes the source client to the HTTP layer, which needs it for the
 // account tab and the cloud directory browser.
 func (e *Engine) CLI() *aliyunpan.CLI {
 	e.mu.Lock()
@@ -183,8 +180,22 @@ func (e *Engine) Load(ctx context.Context) error {
 	return nil
 }
 
-// aliyunpanDir is where the CLI's binary and its isolated config live.
-func (e *Engine) aliyunpanDir() string { return filepath.Join(e.dataDir, "aliyunpan") }
+// aliyunpanDir is where the source client's compatible credential config and
+// staging data live. Older host versions passed the plugin-specific directory
+// as dataDir, while newer ones pass its parent; accepting both layouts avoids
+// moving an existing aliyunpan_config.json a second time during upgrade.
+func (e *Engine) aliyunpanDir() string {
+	canonical := filepath.Join(e.dataDir, "aliyunpan")
+	if hasCredentialFile(e.dataDir) && !hasCredentialFile(canonical) {
+		return e.dataDir
+	}
+	return canonical
+}
+
+func hasCredentialFile(dataDir string) bool {
+	info, err := os.Stat(filepath.Join(dataDir, "config", "aliyunpan_config.json"))
+	return err == nil && !info.IsDir()
+}
 
 // StageDir is where cloud files are staged before being pushed to Telegram.
 func (e *Engine) StageDir() string {
@@ -233,19 +244,13 @@ func (e *Engine) SaveSettings(ctx context.Context, next settings.Settings) error
 	return nil
 }
 
-// applySettings swaps the document in, rebuilding the CLI when the binary path
-// changed so an operator's correction takes effect without a restart.
+// applySettings swaps the document in. BinaryPath is intentionally ignored by
+// the source client, but remains in the document for old configuration files.
 func (e *Engine) applySettings(next settings.Settings) {
 	e.mu.Lock()
 	oldJobs := e.settings.Jobs
-	oldBinaryPath := e.settings.BinaryPath
 	changedJobs := !reflect.DeepEqual(oldJobs, next.Jobs)
-	rebuild := e.cli == nil || oldBinaryPath != next.BinaryPath
-	previousCLI := e.cli
 	e.settings = next
-	if rebuild {
-		e.cli = aliyunpan.New(e.aliyunpanDir(), next.BinaryPath)
-	}
 	if changedJobs {
 		stale := changedJobIDs(oldJobs, next.Jobs)
 		if len(stale) > 0 {
@@ -263,17 +268,6 @@ func (e *Engine) applySettings(next settings.Settings) {
 		}
 	}
 	e.mu.Unlock()
-	if rebuild && previousCLI != nil {
-		// A path change invalidates an in-flight login/download on the old CLI;
-		// otherwise it can keep the old config or executable busy while the new
-		// CLI is already being used by the engine.
-		previousCLI.CancelLogin()
-		previousCLI.CancelRunning()
-	}
-	if rebuild {
-		e.invalidateProbe()
-		e.requestProbeRefresh()
-	}
 }
 
 func changedJobIDs(oldJobs, newJobs []settings.Job) map[string]bool {
@@ -310,9 +304,8 @@ func (e *Engine) Run(ctx context.Context) {
 	}()
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
-	// Warm the account and binary probe before anyone opens the page, so the
-	// first render already knows whether the CLI is installed and linked
-	// rather than reporting "not installed" until its own refresh lands.
+	// Warm the account probe before anyone opens the page, so the first render
+	// already knows whether the source credential is linked.
 	e.probeMu.Lock()
 	probeNeeded := !e.probes.refreshing
 	if probeNeeded {
@@ -335,7 +328,6 @@ func (e *Engine) Run(ctx context.Context) {
 			e.mu.Unlock()
 			if cli := e.CLI(); cli != nil {
 				cli.CancelLogin()
-				cli.CancelRunning()
 			}
 			e.workers.Wait()
 			e.persistNow(context.WithoutCancel(ctx))
@@ -365,8 +357,8 @@ func (e *Engine) Wait(ctx context.Context) {
 }
 
 // backgroundContext is cancelled with the plugin scheduler. Requests that
-// start scans, probes, or a binary installation are only acknowledgements;
-// their contexts must not cancel the work as soon as the HTTP response ends.
+// start scans or probes are only acknowledgements; their contexts must not
+// cancel the work as soon as the HTTP response ends.
 func (e *Engine) backgroundContext() context.Context {
 	e.mu.Lock()
 	ctx := e.runCtx

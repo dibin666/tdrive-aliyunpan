@@ -161,6 +161,20 @@ func TestUnknownAPIRouteIs404(t *testing.T) {
 	}
 }
 
+func TestLegacyBinaryInstallRouteReportsBuiltInClient(t *testing.T) {
+	server := newServer(t)
+	response, err := server.Handle(context.Background(), request(http.MethodPost, "/api/binary/install", "admin-1", ""))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if response.Status != http.StatusGone {
+		t.Fatalf("status = %d, want 410", response.Status)
+	}
+	if !strings.Contains(string(response.Body), "源码客户端") {
+		t.Fatalf("response = %s", response.Body)
+	}
+}
+
 func TestSettingsRoundTrip(t *testing.T) {
 	server := newServer(t)
 	body := `{"schedule":{"enabled":true,"windowStart":"01:00","windowEnd":"07:00","intervalMinutes":20},

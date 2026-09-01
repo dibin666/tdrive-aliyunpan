@@ -18,9 +18,10 @@ import (
 
 // Settings is the whole configuration document.
 type Settings struct {
-	// BinaryPath overrides the managed aliyunpan binary. It is meant for
-	// offline deployments and self-built binaries; empty means the copy the
-	// plugin downloaded into its own data directory.
+	// BinaryPath is retained for compatibility with settings written by the
+	// binary-based release. The source client ignores it.
+	//
+	// Deprecated: the plugin no longer launches an aliyunpan executable.
 	BinaryPath string `json:"binaryPath"`
 	// StageDir is where a cloud file lands before it is pushed to Telegram.
 	// Empty means <plugin data>/aliyunpan/stage.
@@ -31,8 +32,8 @@ type Settings struct {
 	// whose quota they consume and who sees them in 文件. Empty means the
 	// first enabled administrator.
 	OwnerUserID string `json:"ownerUserId"`
-	// DownloadRate is passed to `aliyunpan config set -max_download_rate`,
-	// e.g. "2MB". Empty leaves aliyunpan's own default alone.
+	// DownloadRate configures the source client's aggregate download limiter,
+	// e.g. "2MB". Empty means unlimited.
 	DownloadRate string   `json:"downloadRate"`
 	Schedule     Schedule `json:"schedule"`
 	Quota        Quota    `json:"quota"`
@@ -66,7 +67,8 @@ type Job struct {
 	Name    string `json:"name"`
 	Enabled bool   `json:"enabled"`
 	// DriveName selects the Aliyun Drive namespace independently for each job.
-	// The CLI's active drive is process-global, so jobs must not rely on it.
+	// The source client always passes the selected drive ID explicitly, so jobs
+	// never rely on a process-global active drive.
 	DriveName  string `json:"driveName"`
 	RemotePath string `json:"remotePath"`
 	TargetPath string `json:"targetPath"`
@@ -125,9 +127,6 @@ var (
 // from the core's textarea gets the same treatment as the plugin's own forms.
 func (s *Settings) Normalize() error {
 	s.BinaryPath = strings.TrimSpace(s.BinaryPath)
-	if s.BinaryPath != "" && !filepath.IsAbs(s.BinaryPath) {
-		return errors.New("binaryPath 必须是绝对路径")
-	}
 	if err := checkPathText("binaryPath", s.BinaryPath); err != nil {
 		return err
 	}
