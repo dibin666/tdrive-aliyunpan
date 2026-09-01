@@ -4,3 +4,6 @@
 /tdrive-aliyunpan
 /dist/
 *.test
+
+# Local agent and debugging scratch space.
+/.cursor/

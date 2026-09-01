@@ -2,6 +2,8 @@ package aliyunpan
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -12,12 +14,81 @@ import (
 	"unicode/utf8"
 )
 
-// DownloadSuffix is what aliyunpan appends to a file it is still writing.
-// Watching that file is how this package reports progress: the CLI's own
-// progress bar is a terminal animation, not something a parser can consume.
+// DownloadSuffix names the checkpoint aliyunpan keeps beside a file it is still
+// writing. It is not a partial copy of the payload: aliyunpan pre-allocates the
+// target file at its final size and writes each slice straight into it at that
+// slice's offset, so the target's size is the finished size from the first
+// moment and never moves. The checkpoint is a small base64 document recording
+// which byte ranges are still outstanding, and it is the only place the real
+// progress of a transfer is written down — the CLI's own progress bar is a
+// terminal animation, not something a parser can consume.
 const DownloadSuffix = ".aliyunpan-downloading"
 
-// progressInterval is how often the partial file is stat'ed. It matches the
+// downloadCheckpoint is the document stored, base64 encoded, in the file named
+// by DownloadSuffix.
+//
+// It describes work that is left rather than work that is done: Ranges holds
+// the not-yet-fetched remainder of each slice currently in flight, and GenBegin
+// is the offset past which no slice has been handed out yet.
+type downloadCheckpoint struct {
+	TotalSize int64           `json:"totalSize"`
+	GenBegin  int64           `json:"genBegin"`
+	Ranges    []checkpointGap `json:"ranges"`
+}
+
+// checkpointGap is one outstanding byte range, half open as [Begin, End).
+type checkpointGap struct {
+	Begin int64 `json:"begin"`
+	End   int64 `json:"end"`
+}
+
+// downloadedFromCheckpoint converts a checkpoint into the number of bytes that
+// have actually landed on disk.
+//
+// The second result reports whether the document could be understood at all.
+// Callers must not fall back to the target file's size when it is false,
+// because that size is the pre-allocated final size and would read as a
+// finished transfer.
+func downloadedFromCheckpoint(raw []byte) (int64, bool) {
+	encoded := strings.TrimSpace(string(raw))
+	if encoded == "" {
+		return 0, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return 0, false
+	}
+	var checkpoint downloadCheckpoint
+	if err := json.Unmarshal(decoded, &checkpoint); err != nil {
+		return 0, false
+	}
+	if checkpoint.TotalSize <= 0 {
+		return 0, false
+	}
+
+	outstanding := int64(0)
+	for _, gap := range checkpoint.Ranges {
+		if gap.End > gap.Begin {
+			outstanding += gap.End - gap.Begin
+		}
+	}
+	// Everything beyond GenBegin has not been requested yet, so it is
+	// outstanding too even though no range describes it.
+	if checkpoint.GenBegin < checkpoint.TotalSize {
+		outstanding += checkpoint.TotalSize - checkpoint.GenBegin
+	}
+
+	done := checkpoint.TotalSize - outstanding
+	if done < 0 {
+		done = 0
+	}
+	if done > checkpoint.TotalSize {
+		done = checkpoint.TotalSize
+	}
+	return done, true
+}
+
+// progressInterval is how often the checkpoint is re-read. It matches the
 // cadence the sync page refreshes at, so a faster poll would only produce
 // numbers nobody reads.
 const progressInterval = 700 * time.Millisecond
@@ -47,9 +118,10 @@ func StagedPath(stageDir, cloudPath string) string {
 
 // Download stages one cloud file on local disk.
 //
-// progress is called with the number of bytes on disk so far, sampled from the
-// partial file. It is advisory: the authoritative result is the finished
-// file's size, which is checked against expectedSize before returning.
+// progress is called with the number of bytes on disk so far, derived from the
+// checkpoint aliyunpan maintains. It is advisory: the authoritative result is
+// the finished file's size, which is checked against expectedSize before
+// returning.
 func (c *CLI) Download(
 	ctx context.Context,
 	request DownloadRequest,
@@ -203,9 +275,14 @@ func unsafeWindowsName(name string) bool {
 	}
 }
 
-// watchProgress samples the partial file until the download ends. It also
-// looks at the finished name, because the last thing aliyunpan does is rename
-// the partial into place and the final sample should reflect that.
+// watchProgress samples the checkpoint until the download ends, then falls back
+// to the finished file.
+//
+// While the checkpoint exists the transfer is still running, and the staged
+// file's size cannot be used: aliyunpan pre-allocated it at the final size, so
+// reporting it would show a completed transfer from the first tick. Once the
+// checkpoint is gone the download is over and the staged file's size is the
+// authoritative answer.
 func watchProgress(ctx context.Context, partial, staged string, progress func(int64)) {
 	ticker := time.NewTicker(progressInterval)
 	defer ticker.Stop()
@@ -214,8 +291,12 @@ func watchProgress(ctx context.Context, partial, staged string, progress func(in
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if info, err := os.Stat(partial); err == nil {
-				progress(info.Size())
+			checkpoint, readErr := os.ReadFile(partial)
+			if readErr == nil {
+				done, parsed := downloadedFromCheckpoint(checkpoint)
+				if parsed {
+					progress(done)
+				}
 				continue
 			}
 			if info, err := os.Stat(staged); err == nil {

@@ -18,8 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/dibin/tdrive-aliyunpan/internal/debuglog"
 )
 
 // CLI is a configured aliyunpan installation.
@@ -58,15 +56,6 @@ func New(dataDir, override string) *CLI {
 		binary = override
 		managed = false
 	}
-	// #region DEBUG H1/H5 CLI path construction
-	debuglog.Write("H1", "internal/aliyunpan/cli.go:54", "CLI path constructed", map[string]any{
-		"dataDir":     dataDir,
-		"overrideSet": override != "",
-		"binaryPath":  binary,
-		"managed":     managed,
-		"configDir":   filepath.Join(dataDir, "config"),
-	})
-	// #endregion
 	return &CLI{
 		binary:      binary,
 		configDir:   filepath.Join(dataDir, "config"),
@@ -203,7 +192,6 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 	if err := os.MkdirAll(c.configDir, 0o750); err != nil {
 		return "", fmt.Errorf("创建 aliyunpan 配置目录: %w", err)
 	}
-	configEntries, configReadErr := os.ReadDir(c.configDir)
 	runCtx, cancel := context.WithTimeout(ctx, options.timeout)
 	defer cancel()
 
@@ -222,24 +210,6 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 
 	err := command.Run()
 	text := output.String()
-	// #region DEBUG H6/H7/H8 aliyunpan command outcome
-	debuglog.Write("H6", "internal/aliyunpan/cli.go:213", "aliyunpan command outcome classified", map[string]any{
-		"command":                  args[0],
-		"argumentCount":            len(args),
-		"exitError":                err != nil,
-		"outputBytes":              len(text),
-		"panic":                    strings.Contains(text, "panic:"),
-		"nilPointerPanic":          strings.Contains(text, "invalid memory address or nil pointer dereference"),
-		"notLoggedInMarker":        strings.Contains(text, notLoggedInMarker),
-		"whoSuccessMarker":         strings.Contains(text, "当前帐号UID:"),
-		"whoSourcePanic":           strings.Contains(text, "internal/command/user_info.go"),
-		"whoLine131Panic":          strings.Contains(text, "user_info.go:131"),
-		"driveInfoErrorMarker":     strings.Contains(text, "getDriveInfo error"),
-		"setupUserErrorMarker":     strings.Contains(text, "setup user error"),
-		"configDirectoryReadOK": configReadErr == nil,
-		"configEntryCount":         len(configEntries),
-	})
-	// #endregion
 	if runCtx.Err() != nil {
 		if errors.Is(runCtx.Err(), context.Canceled) {
 			return text, fmt.Errorf("aliyunpan %s 已取消: %w", args[0], context.Canceled)
@@ -284,16 +254,6 @@ type Account struct {
 // Who returns the currently linked account.
 func (c *CLI) Who(ctx context.Context) (Account, error) {
 	output, err := c.runCommand(ctx, runOptions{timeout: time.Minute}, "who")
-	// #region DEBUG H6/H7 who result interpretation
-	debuglog.Write("H6", "internal/aliyunpan/cli.go:257", "who result interpreted by plugin", map[string]any{
-		"runError":           err != nil,
-		"notLoggedInMarker":  strings.Contains(output, notLoggedInMarker),
-		"panic":              strings.Contains(output, "panic:"),
-		"nilPointerPanic":    strings.Contains(output, "invalid memory address or nil pointer dereference"),
-		"sourcePanic":        strings.Contains(output, "internal/command/user_info.go"),
-		"successMarker":      strings.Contains(output, "当前帐号UID:"),
-	})
-	// #endregion
 	if strings.Contains(output, notLoggedInMarker) {
 		return Account{}, ErrNotLoggedIn
 	}
