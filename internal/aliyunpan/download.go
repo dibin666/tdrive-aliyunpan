@@ -185,11 +185,9 @@ func (c *CLI) Download(
 		}()
 	}
 
-	// Downloads share the same command gate as the short commands. aliyunpan
-	// rewrites its config file after every command, so allowing a multi-hour
-	// download beside `ll` or `who` could overwrite a refreshed token or drive
-	// selection. The UI keeps the browser responsive because each request is
-	// still independent and the gate is acquired with its request context.
+	// runDownload serializes downloads separately and gives this process a
+	// private config snapshot. It therefore cannot hold up a browser `ll` or
+	// overwrite the canonical config while a token is being refreshed.
 	args := []string{
 		"download", request.CloudPath,
 		"-saveto", request.StageDir,
@@ -202,7 +200,7 @@ func (c *CLI) Download(
 	if request.DriveID != "" {
 		args = append(args, "-driveId", request.DriveID)
 	}
-	output, err := c.runCommand(ctx, runOptions{timeout: request.Timeout}, args...)
+	output, err := c.runDownload(ctx, runOptions{timeout: request.Timeout}, args...)
 	stopWatching()
 
 	if strings.Contains(output, notLoggedInMarker) {

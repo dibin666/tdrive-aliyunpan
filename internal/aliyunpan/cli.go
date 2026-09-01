@@ -28,12 +28,16 @@ type CLI struct {
 	// opposed to an operator-supplied path.
 	managed bool
 
-	// commandGate serializes every aliyunpan process, including downloads. The
-	// CLI rewrites its config file after almost every command, so allowing a
-	// concurrent `ll` or `who` to run beside a download can lose a refreshed
-	// token or the selected drive.
+	// commandGate serializes short commands that use the canonical config. The
+	// CLI rewrites its config file after almost every command, so two of these
+	// commands must not run at the same time.
 	commandGate     chan struct{}
 	commandGateInit sync.Once
+	// downloadGate keeps downloads serial with each other. Downloads do not
+	// hold commandGate for their whole lifetime: each one gets a private config
+	// snapshot first, so a multi-hour transfer cannot block the directory
+	// browser or corrupt the canonical token file.
+	downloadGate chan struct{}
 	runningMu       sync.Mutex
 	running         map[uint64]context.CancelFunc
 	nextRunID       uint64
@@ -61,6 +65,7 @@ func New(dataDir, override string) *CLI {
 		configDir:   filepath.Join(dataDir, "config"),
 		managed:     managed,
 		commandGate: make(chan struct{}, 1),
+		downloadGate: make(chan struct{}, 1),
 		running:     make(map[uint64]context.CancelFunc),
 	}
 }
@@ -79,13 +84,19 @@ func (c *CLI) InstallManaged(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Installing replaces the executable. Keep it behind the same gate as
-	// probes, login and transfers so no command can be using a half-replaced
-	// file (and so Windows is not asked to replace a running executable).
+	// Installing replaces the executable. Keep it behind both gates so no
+	// command can be using a half-replaced file (and so Windows is not asked to
+	// replace a running executable).
 	installCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	unregister := c.registerRunning(cancel)
 	defer unregister()
+	// Acquire the gates in the same order as runDownload. In particular, do
+	// not hold commandGate while waiting for a download to finish.
+	if err := c.acquireDownload(installCtx); err != nil {
+		return err
+	}
+	defer c.releaseDownload()
 	if err := c.acquireCommand(installCtx); err != nil {
 		return err
 	}
@@ -98,6 +109,9 @@ type runOptions struct {
 	// stdin is written to the child before its output is read. Only the login
 	// flow uses it, and it uses the interactive helper below instead.
 	stdin string
+	// configDir overrides the canonical config for an isolated command, as used
+	// by downloads. An empty value uses c.configDir.
+	configDir string
 }
 
 func (c *CLI) initCommandGate() {
@@ -107,6 +121,9 @@ func (c *CLI) initCommandGate() {
 		}
 		if c.running == nil {
 			c.running = make(map[uint64]context.CancelFunc)
+		}
+		if c.downloadGate == nil {
+			c.downloadGate = make(chan struct{}, 1)
 		}
 	})
 }
@@ -128,6 +145,23 @@ func (c *CLI) releaseCommand() {
 	<-c.commandGate
 }
 
+func (c *CLI) acquireDownload(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.initCommandGate()
+	select {
+	case c.downloadGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *CLI) releaseDownload() {
+	<-c.downloadGate
+}
+
 func (c *CLI) runCommand(ctx context.Context, options runOptions, args ...string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -144,6 +178,93 @@ func (c *CLI) runCommand(ctx context.Context, options runOptions, args ...string
 	}
 	defer c.releaseCommand()
 	return c.run(commandCtx, options, args...)
+}
+
+// runDownload executes a long-lived download without occupying the short
+// command slot. The upstream CLI persists refreshed tokens in its config
+// directory, so the download works against a snapshot rather than writing the
+// canonical config concurrently with `who`, `drive`, or `ll`.
+func (c *CLI) runDownload(ctx context.Context, options runOptions, args ...string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	commandCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	unregister := c.registerRunning(cancel)
+	defer unregister()
+	if err := c.acquireDownload(commandCtx); err != nil {
+		return "", err
+	}
+	defer c.releaseDownload()
+
+	configDir, cleanup, err := c.snapshotConfig(commandCtx)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	options.configDir = configDir
+	return c.run(commandCtx, options, args...)
+}
+
+// snapshotConfig copies the canonical CLI state while short commands are
+// excluded. A download may refresh its private copy for as long as it runs,
+// without racing a later command that refreshes the canonical copy.
+func (c *CLI) snapshotConfig(ctx context.Context) (string, func(), error) {
+	if err := c.acquireCommand(ctx); err != nil {
+		return "", nil, err
+	}
+	defer c.releaseCommand()
+
+	if err := os.MkdirAll(c.configDir, 0o750); err != nil {
+		return "", nil, fmt.Errorf("创建 aliyunpan 配置目录: %w", err)
+	}
+	privateDir, err := os.MkdirTemp(filepath.Dir(c.configDir), ".aliyunpan-download-config-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("创建下载配置目录: %w", err)
+	}
+	if err := copyConfigDirectory(c.configDir, privateDir); err != nil {
+		_ = os.RemoveAll(privateDir)
+		return "", nil, fmt.Errorf("复制 aliyunpan 配置: %w", err)
+	}
+	return privateDir, func() { _ = os.RemoveAll(privateDir) }, nil
+}
+
+func copyConfigDirectory(source, destination string) error {
+	entries, err := os.ReadDir(source)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		destinationPath := filepath.Join(destination, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := os.MkdirAll(destinationPath, info.Mode().Perm()); err != nil {
+				return err
+			}
+			if err := copyConfigDirectory(sourcePath, destinationPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("配置目录含有不支持的文件: %s", sourcePath)
+		}
+		contents, err := os.ReadFile(sourcePath)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(destinationPath, contents, info.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *CLI) registerRunning(cancel context.CancelFunc) func() {
@@ -189,14 +310,18 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 	if len(args) == 0 {
 		return "", errors.New("aliyunpan 命令不能为空")
 	}
-	if err := os.MkdirAll(c.configDir, 0o750); err != nil {
+	configDir := options.configDir
+	if configDir == "" {
+		configDir = c.configDir
+	}
+	if err := os.MkdirAll(configDir, 0o750); err != nil {
 		return "", fmt.Errorf("创建 aliyunpan 配置目录: %w", err)
 	}
 	runCtx, cancel := context.WithTimeout(ctx, options.timeout)
 	defer cancel()
 
 	command := exec.CommandContext(runCtx, c.binary, args...)
-	command.Env = c.environment()
+	command.Env = c.environment(configDir)
 	if options.stdin != "" {
 		command.Stdin = strings.NewReader(options.stdin)
 	} else {
@@ -225,7 +350,7 @@ func (c *CLI) run(ctx context.Context, options runOptions, args ...string) (stri
 // environment isolates the CLI's state in the plugin's own directory so it
 // never picks up — or clobbers — an aliyunpan installation the host may
 // already have.
-func (c *CLI) environment() []string {
+func (c *CLI) environment(configDir string) []string {
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -234,7 +359,7 @@ func (c *CLI) environment() []string {
 		}
 		env = append(env, entry)
 	}
-	return append(env, "ALIYUNPAN_CONFIG_DIR="+c.configDir)
+	return append(env, "ALIYUNPAN_CONFIG_DIR="+configDir)
 }
 
 // ErrNotLoggedIn is what every command degrades into before an account is

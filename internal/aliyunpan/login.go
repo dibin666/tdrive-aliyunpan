@@ -117,7 +117,7 @@ func (c *CLI) StartLogin(ctx context.Context) (LoginState, error) {
 	// ticket afterwards.
 	sessionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), LoginLinkTTL+2*time.Minute)
 	command := exec.CommandContext(sessionCtx, c.binary, "login")
-	command.Env = c.environment()
+	command.Env = c.environment(c.configDir)
 
 	stdin, err := command.StdinPipe()
 	if err != nil {
