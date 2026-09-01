@@ -29,8 +29,13 @@ type Stage string
 const (
 	StageIdle        Stage = ""
 	StageDownloading Stage = "downloading"
-	StageUploading   Stage = "uploading"
-	StageFinishing   Stage = "finishing"
+	// StageWaitingUpload is a finished download holding a staged file while it
+	// waits for a tdrive upload slot. It exists because that wait used to be
+	// spent still labelled "downloading" at 100%, which read on the page as a
+	// transfer that had stalled rather than one that was queued.
+	StageWaitingUpload Stage = "waiting-upload"
+	StageUploading     Stage = "uploading"
+	StageFinishing     Stage = "finishing"
 )
 
 // Item is one file on its way from Aliyun Drive into tdrive.
@@ -43,11 +48,11 @@ type Item struct {
 	RemotePath string `json:"remotePath"`
 	// FileID is populated by the source API scanner. It is optional for queue
 	// records written by the old CLI integration, which fall back to the path.
-	FileID     string `json:"fileId,omitempty"`
-	TargetDir  string `json:"targetDir"`
-	Name       string `json:"name"`
-	Size       int64  `json:"size"`
-	SHA1       string `json:"sha1,omitempty"`
+	FileID    string `json:"fileId,omitempty"`
+	TargetDir string `json:"targetDir"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	SHA1      string `json:"sha1,omitempty"`
 
 	State State `json:"state"`
 	Stage Stage `json:"stage,omitempty"`

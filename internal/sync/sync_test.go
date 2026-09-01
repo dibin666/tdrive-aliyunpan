@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -277,9 +278,9 @@ func TestItemStageDirIsUniquePerQueueItem(t *testing.T) {
 
 func TestSuccessfulUploadLocalCleanupPolicy(t *testing.T) {
 	cases := []struct {
-		name                 string
+		name                   string
 		deleteLocalAfterUpload bool
-		wantRetained         bool
+		wantRetained           bool
 	}{
 		{name: "delete immediately", deleteLocalAfterUpload: true, wantRetained: false},
 		{name: "retain when disabled", deleteLocalAfterUpload: false, wantRetained: true},
@@ -331,9 +332,202 @@ func TestCancelledTransferIsRequeuedFromUpload(t *testing.T) {
 	if item.State != StatePending || item.Stage != StageIdle {
 		t.Fatalf("cancelled item state = %s/%s, want pending/idle", item.State, item.Stage)
 	}
-	if item.Downloaded != 0 || item.Uploaded != 0 || item.UploadJobID != "" || item.FinishedAt != 0 {
-		t.Fatalf("cancelled item retained transfer state: %+v", item)
+	if item.Uploaded != 0 || item.UploadJobID != "" || item.FinishedAt != 0 {
+		t.Fatalf("requeued item retained upload state: %+v", item)
 	}
+	// The staged bytes survive the requeue, because the retry resumes from them
+	// instead of downloading the file a second time.
+	if item.Downloaded != 20 {
+		t.Fatalf("requeued item downloaded = %d, want the staged bytes to be kept", item.Downloaded)
+	}
+}
+
+func TestNoteDownloadFollowsTheDownloaderInBothDirections(t *testing.T) {
+	engine := &Engine{}
+	item := &Item{Size: 100}
+
+	engine.noteDownload(item, 60)
+	if item.Downloaded != 60 {
+		t.Fatalf("downloaded = %d, want 60", item.Downloaded)
+	}
+	// A chunk whose connection broke gives back the bytes it never committed.
+	engine.noteDownload(item, 32)
+	if item.Downloaded != 32 {
+		t.Fatalf("downloaded = %d, want the downloader's rollback to be reflected", item.Downloaded)
+	}
+	engine.noteDownload(item, 500)
+	if item.Downloaded != 100 {
+		t.Fatalf("downloaded = %d, want it clamped to the file size", item.Downloaded)
+	}
+}
+
+func TestStageRoomDoesNotDoubleCountAnInFlightDownload(t *testing.T) {
+	stageRoot := t.TempDir()
+	engine := &Engine{settings: settings.Settings{StageLimitBytes: 30}}
+	limits := hostapi.RuntimeSettings{}
+
+	release, err := engine.reserveStageRoom("item-a", 20, stageRoot, limits)
+	if err != nil {
+		t.Fatalf("reserve first: %v", err)
+	}
+	// A download pre-allocates its .part file at the final size, so the same
+	// bytes are visible to a directory walk while the reservation is still held.
+	itemDirectory := itemStageDir(stageRoot, "item-a")
+	if err := os.MkdirAll(itemDirectory, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(itemDirectory, "file.bin.part"), make([]byte, 20), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	secondRelease, err := engine.reserveStageRoom("item-b", 10, stageRoot, limits)
+	if err != nil {
+		t.Fatalf("reserve second: %v, want the pre-allocated file counted once", err)
+	}
+	secondRelease()
+
+	if _, err := engine.reserveStageRoom("item-c", 15, stageRoot, limits); !errors.Is(err, ErrStageRoom) {
+		t.Fatalf("third reservation error = %v, want ErrStageRoom once the limit is really reached", err)
+	}
+	release()
+}
+
+// storedDataHost serves plugin-data reads from an in-memory map, which is what
+// Load needs in order to restore a queue.
+type storedDataHost struct {
+	values map[string]string
+}
+
+func (host *storedDataHost) Call(_ context.Context, method string, request, response any) error {
+	if method != "data.get" {
+		return nil
+	}
+	key, _ := request.(map[string]string)
+	stored, ok := host.values[key["key"]]
+	if !ok {
+		return errors.New("database: not found")
+	}
+	raw, ok := response.(*json.RawMessage)
+	if !ok {
+		return fmt.Errorf("unexpected data.get response %T", response)
+	}
+	*raw = json.RawMessage(stored)
+	return nil
+}
+
+func (host *storedDataHost) OpenStream(context.Context, string, any) (io.ReadWriteCloser, error) {
+	return nil, errors.New("not supported")
+}
+
+// A plugin restart used to publish every in-flight transfer as un-downloaded,
+// which is what made a file at 50% jump back to 0 and start again. The staging
+// area is the authority now, so a restart reports whatever is actually there.
+func TestLoadReportsDownloadProgressFromTheStagingArea(t *testing.T) {
+	dataDir := t.TempDir()
+	stageDir := filepath.Join(dataDir, "stage")
+	item := &Item{
+		ID: "item-a", JobID: "job-1", RemotePath: "/movies/a.mkv", Name: "a.mkv",
+		TargetDir: "/in", Size: 12, State: StateRunning, Stage: StageDownloading,
+		Downloaded: 12, Uploaded: 5, UploadJobID: "upload-1",
+	}
+	queueJSON, err := json.Marshal([]*Item{item})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	settingsJSON, err := json.Marshal(settings.Settings{StageDir: stageDir})
+	if err != nil {
+		t.Fatalf("Marshal settings: %v", err)
+	}
+	host := &storedDataHost{values: map[string]string{
+		queueKey:    string(queueJSON),
+		SettingsKey: string(settingsJSON),
+	}}
+
+	// Half the file is on disk behind a checkpoint written by the downloader.
+	downloadDir := itemStageDir(stageDir, item.ID)
+	if err := writePartialDownload(downloadDir, item.RemotePath, item.Size); err != nil {
+		t.Fatalf("stage a partial download: %v", err)
+	}
+
+	engine := New(hostapi.New(host), dataDir, nil)
+	if err := engine.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.queue) != 1 {
+		t.Fatalf("queue = %d items, want 1", len(engine.queue))
+	}
+	restored := engine.queue[0]
+	if restored.State != StatePending || restored.Stage != StageIdle {
+		t.Fatalf("restored state = %s/%s, want pending/idle", restored.State, restored.Stage)
+	}
+	if restored.Uploaded != 0 || restored.UploadJobID != "" {
+		t.Fatalf("restored item kept upload state: %+v", restored)
+	}
+	if restored.Downloaded != 6 {
+		t.Fatalf("restored downloaded = %d, want the 6 bytes actually staged", restored.Downloaded)
+	}
+}
+
+// Keeping partial downloads means the staging area can hold work for items that
+// no longer exist. Left alone it counts against the staging limit forever and
+// eventually stops everything from starting.
+func TestLoadRemovesStagingDirectoriesWithNoQueueItem(t *testing.T) {
+	dataDir := t.TempDir()
+	stageDir := filepath.Join(dataDir, "stage")
+	item := &Item{
+		ID: "item-a", JobID: "job-1", RemotePath: "/movies/a.mkv", Name: "a.mkv",
+		TargetDir: "/in", Size: 12, State: StatePending,
+	}
+	queueJSON, _ := json.Marshal([]*Item{item})
+	settingsJSON, _ := json.Marshal(settings.Settings{StageDir: stageDir})
+	host := &storedDataHost{values: map[string]string{
+		queueKey: string(queueJSON), SettingsKey: string(settingsJSON),
+	}}
+
+	if err := writePartialDownload(itemStageDir(stageDir, "item-a"), item.RemotePath, item.Size); err != nil {
+		t.Fatalf("stage the live item: %v", err)
+	}
+	orphan := itemStageDir(stageDir, "item-gone")
+	if err := writePartialDownload(orphan, "/movies/b.mkv", 12); err != nil {
+		t.Fatalf("stage the orphan: %v", err)
+	}
+
+	engine := New(hostapi.New(host), dataDir, nil)
+	if err := engine.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphaned staging directory survived: %v", err)
+	}
+	if _, err := os.Stat(itemStageDir(stageDir, "item-a")); err != nil {
+		t.Fatalf("a queued item's staging directory was removed: %v", err)
+	}
+}
+
+// writePartialDownload reproduces what the downloader leaves behind mid-file: a
+// .part pre-allocated at the final size, and a sidecar naming the chunks that
+// landed. The document is written literally because it is the on-disk contract
+// between the two packages, and this test exists to prove the engine reads it;
+// the downloader's own tests cover producing and consuming it.
+//
+// A 12-byte file in 6-byte chunks is two chunks, of which only the first is
+// done — bit 0 set, which is the single byte 0x01.
+func writePartialDownload(downloadDir, cloudPath string, size int64) error {
+	partial := aliyunpan.StagedPath(downloadDir, cloudPath) + ".part"
+	if err := os.MkdirAll(filepath.Dir(partial), 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(partial, make([]byte, size), 0o600); err != nil {
+		return err
+	}
+	sidecar := fmt.Sprintf(
+		`{"version":1,"driveId":"drive-1","fileId":"file-1","size":%d,"chunkSize":6,"done":"AQ=="}`, size,
+	)
+	return os.WriteFile(partial+".progress", []byte(sidecar), 0o600)
 }
 
 type zeroSegmentHost struct {

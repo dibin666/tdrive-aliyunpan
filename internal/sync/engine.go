@@ -56,11 +56,14 @@ type Engine struct {
 	uploadActive   int
 	reserved       int64
 	stageReserved  int64
-	lastScan       time.Time
-	scanning       bool
-	scanError      string
-	paused         bool
-	stopping       bool
+	// stageReservations is the same total broken down per queue item, so a
+	// directory walk can skip the files a reservation already accounts for.
+	stageReservations map[string]int64
+	lastScan          time.Time
+	scanning          bool
+	scanError         string
+	paused            bool
+	stopping          bool
 	// runCtx is the plugin-lifetime context. HTTP-triggered background work
 	// uses it instead of the short-lived request context, but still stops when
 	// the host shuts the plugin down.
@@ -153,6 +156,9 @@ func (e *Engine) Load(ctx context.Context) error {
 		e.logger.Printf("读取配额计数失败，从零开始: %v", err)
 	}
 
+	// Resolved before the lock is taken because StageDir would take it again.
+	stageDir := stageDirFor(stored, e.aliyunpanDir())
+
 	e.mu.Lock()
 	e.settings = stored
 	e.quota = quota
@@ -164,16 +170,25 @@ func (e *Engine) Load(ctx context.Context) error {
 		if item.DriveName == "" {
 			item.DriveName = settings.DefaultDriveName
 		}
-		// Anything that was running when the process stopped is put back in
-		// the queue: segments already in Telegram are re-sent, which is
-		// wasteful but always correct, whereas trusting a counter written
-		// before a crash is not.
+		// Anything that was running when the process stopped is put back in the
+		// queue. The upload half starts over: segments already in Telegram are
+		// re-sent, which is wasteful but always correct, whereas trusting a
+		// counter written before a crash is not.
 		if item.State == StateRunning {
 			item.State = StatePending
 			item.Stage = StageIdle
-			item.Downloaded = 0
 			item.Uploaded = 0
 			item.UploadJobID = ""
+		}
+		if item.Active() {
+			// The download half is not restarted. Its bytes are on disk behind a
+			// checkpoint, so the staging area — not the counter written before
+			// the process died — decides how much of this file is really there.
+			// Zeroing it here is what made every plugin restart look as though
+			// nothing had ever been downloaded.
+			item.Downloaded = aliyunpan.StagedDownloadBytes(
+				itemStageDir(stageDir, item.ID), item.RemotePath, item.Size,
+			)
 		}
 		e.queue = append(e.queue, item)
 	}
@@ -182,8 +197,37 @@ func (e *Engine) Load(ctx context.Context) error {
 	e.quotaDirty = false
 	e.queueRevision = 0
 	e.quotaRevision = 0
+	live := make(map[string]bool, len(e.queue))
+	for _, item := range e.queue {
+		live[item.ID] = true
+	}
 	e.mu.Unlock()
+
+	e.pruneOrphanStageDirs(stageDir, live)
 	return nil
+}
+
+// pruneOrphanStageDirs deletes staging directories no queue item claims.
+//
+// Partial downloads are kept now so an interrupted transfer can resume, which
+// means the staging area can accumulate work for items that were deleted,
+// cleared, or belonged to a job that no longer exists. Left alone those files
+// count against the staging limit forever and eventually stop every new
+// transfer from starting — trading one bug for a slower one.
+func (e *Engine) pruneOrphanStageDirs(stageDir string, live map[string]bool) {
+	itemsRoot := filepath.Join(stageDir, stageItemsDir)
+	entries, err := os.ReadDir(itemsRoot)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || live[entry.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(itemsRoot, entry.Name())); err != nil {
+			e.logger.Printf("清理无主暂存目录 %s 失败: %v", entry.Name(), err)
+		}
+	}
 }
 
 // aliyunpanDir is where the source client's compatible credential config and
@@ -208,10 +252,16 @@ func (e *Engine) StageDir() string {
 	e.mu.Lock()
 	configured := e.settings.StageDir
 	e.mu.Unlock()
-	if configured != "" {
-		return configured
+	return stageDirFor(settings.Settings{StageDir: configured}, e.aliyunpanDir())
+}
+
+// stageDirFor applies the same rule without touching the engine's lock, so
+// startup can resolve the staging area while it is already holding it.
+func stageDirFor(document settings.Settings, aliyunpanDir string) string {
+	if document.StageDir != "" {
+		return document.StageDir
 	}
-	return filepath.Join(e.aliyunpanDir(), "stage")
+	return filepath.Join(aliyunpanDir, "stage")
 }
 
 // Settings returns the scheduler's copy of the configuration document.
@@ -686,20 +736,33 @@ func (e *Engine) setStage(item *Item, stage Stage) {
 	e.mu.Unlock()
 }
 
+// noteDownload records the downloader's absolute view of how much of a file is
+// on disk.
+//
+// It is absolute, and it is allowed to go down. The downloader retries one
+// chunk at a time, and a chunk whose connection broke has to give back the
+// bytes it had read but never committed; a counter that could only rise would
+// keep claiming them. It also lets a resumed transfer correct a stale figure
+// left by an earlier attempt in either direction on its very first report.
+// Only forward movement feeds the speed estimate, since a rollback is not
+// throughput.
 func (e *Engine) noteDownload(item *Item, done int64) {
-	e.mu.Lock()
-	if done > item.Downloaded {
-		if item.Size >= 0 && done > item.Size {
-			done = item.Size
-		}
-		if done <= item.Downloaded {
-			e.mu.Unlock()
-			return
-		}
-		item.observe(done-item.Downloaded, time.Now())
-		item.Downloaded = done
-		e.markQueueDirtyLocked()
+	if done < 0 {
+		done = 0
 	}
+	e.mu.Lock()
+	if item.Size >= 0 && done > item.Size {
+		done = item.Size
+	}
+	if done == item.Downloaded {
+		e.mu.Unlock()
+		return
+	}
+	if done > item.Downloaded {
+		item.observe(done-item.Downloaded, time.Now())
+	}
+	item.Downloaded = done
+	e.markQueueDirtyLocked()
 	e.mu.Unlock()
 }
 
@@ -1026,10 +1089,35 @@ func (e *Engine) stagedBytes() int64 {
 }
 
 func (e *Engine) stagedBytesAt(stageDir string) int64 {
+	return e.stagedBytesExcluding(stageDir, nil)
+}
+
+// stagedBytesExcluding measures the staging tree while ignoring the private
+// directories of items that already hold a reservation.
+//
+// Those two numbers describe the same bytes. A download pre-allocates its
+// .part file at the file's final size so its chunk workers can write straight
+// to their own offsets, which means the whole file shows up in a directory walk
+// from the first moment — while its reservation is still outstanding. Adding
+// the walk to the reservations therefore counted every in-flight download
+// twice, and the second concurrent transfer was refused for lack of room long
+// before the limit was really reached. Skipping the reserved items' own
+// directories makes the walk mean "everything nobody has already accounted
+// for".
+func (e *Engine) stagedBytesExcluding(stageDir string, skipItems map[string]bool) int64 {
+	itemsRoot := filepath.Join(stageDir, stageItemsDir)
 	var total int64
 	_ = filepath.WalkDir(stageDir, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
+		if err != nil {
 			return nil //nolint:nilerr // an unreadable staging tree is reported by the transfer itself
+		}
+		if entry.IsDir() {
+			if len(skipItems) > 0 &&
+				filepath.Dir(path) == itemsRoot &&
+				skipItems[entry.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if info, statErr := entry.Info(); statErr == nil {
 			total += info.Size()
@@ -1051,7 +1139,7 @@ func (e *Engine) stageLimit(limits hostapi.RuntimeSettings) int64 {
 	return limits.CacheLimit
 }
 
-func (e *Engine) reserveStageRoom(size int64, stageDir string, limits hostapi.RuntimeSettings) (func(), error) {
+func (e *Engine) reserveStageRoom(itemID string, size int64, stageDir string, limits hostapi.RuntimeSettings) (func(), error) {
 	if size < 0 {
 		return nil, fmt.Errorf("文件大小不能为负数: %d", size)
 	}
@@ -1059,7 +1147,23 @@ func (e *Engine) reserveStageRoom(size int64, stageDir string, limits hostapi.Ru
 	if limit <= 0 {
 		return func() {}, nil
 	}
-	used := e.stagedBytesAt(stageDir)
+
+	e.mu.Lock()
+	reservedItems := make(map[string]bool, len(e.stageReservations)+1)
+	for id := range e.stageReservations {
+		reservedItems[id] = true
+	}
+	// This item's own directory may already hold a partially downloaded file
+	// from an earlier attempt. Those bytes are covered by the reservation about
+	// to be taken, so counting them as well would make a resumed transfer look
+	// twice as expensive as a fresh one.
+	if itemID != "" {
+		reservedItems[itemID] = true
+	}
+	e.mu.Unlock()
+
+	used := e.stagedBytesExcluding(stageDir, reservedItems)
+
 	e.mu.Lock()
 	reserved := e.stageReserved
 	if used+reserved+size > limit && used+reserved > 0 {
@@ -1068,27 +1172,37 @@ func (e *Engine) reserveStageRoom(size int64, stageDir string, limits hostapi.Ru
 			ErrStageRoom, used+reserved, limit, size)
 	}
 	e.stageReserved += size
+	if itemID != "" {
+		if e.stageReservations == nil {
+			e.stageReservations = make(map[string]int64)
+		}
+		e.stageReservations[itemID] += size
+	}
 	e.mu.Unlock()
 
-	released := false
+	var releaseOnce sync.Once
 	return func() {
-		if released {
-			return
-		}
-		released = true
-		e.mu.Lock()
-		e.stageReserved -= size
-		if e.stageReserved < 0 {
-			e.stageReserved = 0
-		}
-		e.mu.Unlock()
+		releaseOnce.Do(func() {
+			e.mu.Lock()
+			e.stageReserved -= size
+			if e.stageReserved < 0 {
+				e.stageReserved = 0
+			}
+			if itemID != "" && e.stageReservations != nil {
+				e.stageReservations[itemID] -= size
+				if e.stageReservations[itemID] <= 0 {
+					delete(e.stageReservations, itemID)
+				}
+			}
+			e.mu.Unlock()
+		})
 	}, nil
 }
 
 // checkStageRoom keeps the old inspection-only helper for callers and tests;
 // transfers use reserveStageRoom so concurrent downloads also reserve space.
 func (e *Engine) checkStageRoom(item *Item, stageDir string, limits hostapi.RuntimeSettings) error {
-	release, err := e.reserveStageRoom(item.Size, stageDir, limits)
+	release, err := e.reserveStageRoom(item.ID, item.Size, stageDir, limits)
 	if release != nil {
 		release()
 	}

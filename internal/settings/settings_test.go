@@ -150,7 +150,7 @@ func TestNormalizeRejections(t *testing.T) {
 	cases := map[string]Settings{
 		"相对暂存路径":   {StageDir: "stage"},
 		"负配额":      {Quota: Quota{DailyBytes: -1}},
-		"负阿里云盘并发": {DownloadConcurrency: -1},
+		"负阿里云盘并发":  {DownloadConcurrency: -1},
 		"超出阿里云盘并发": {DownloadConcurrency: maxDownloadConcurrency + 1},
 		"畸形时刻":     {Schedule: Schedule{WindowStart: "25:00"}},
 		"畸形重置时刻":   {Quota: Quota{ResetAt: "7:5"}},

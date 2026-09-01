@@ -52,44 +52,55 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 	ctx, release := e.watchItem(ctx, item.ID)
 	defer release()
 
+	// Partial work is kept for anything that will be tried again, and thrown
+	// away for anything that will not. A transfer that is requeued — because a
+	// token expired, a context was cancelled, or the staging area was briefly
+	// full — resumes from the chunks already on disk, which is the difference
+	// between retrying a file and downloading it a second time. A transfer that
+	// failed for good, or that somebody cancelled, leaves nothing behind.
+	discardStaged := true
+	defer func() {
+		if discardStaged {
+			e.discardStagedWork(item)
+		}
+	}()
+
 	staged, err := e.stage(ctx, item, limits)
 	if err != nil {
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
 		if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
+			discardStaged = false
 			e.invalidateProbe()
 			e.requestProbeRefresh()
 			e.deferUntilLogin(ctx, item)
 			return false
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			discardStaged = false
 			e.deferUntilRetry(ctx, item, err)
 			return false
 		}
 		if errors.Is(err, ErrStageRoom) {
+			// Nothing was downloaded, but an earlier attempt's chunks may still
+			// be there and are exactly what makes the retry cheap enough to fit.
+			discardStaged = false
 			e.deferUntilRetry(ctx, item, err)
 			return false
 		}
 		e.fail(ctx, item, err)
 		return true
 	}
-	// The staged copy is disk the drive is not managing, so it is removed on
-	// every unsuccessful exit path. A successful upload may retain it when the
-	// administrator has explicitly chosen to keep local copies.
-	retainStagedOnSuccess := false
-	defer func() {
-		if !retainStagedOnSuccess {
-			cleanupStaged(staged, item.ID)
-		}
-	}()
 
+	e.setStage(item, StageWaitingUpload)
 	releaseUpload, err := e.acquireUploadSlot(ctx, limits.UploadConcurrency)
 	if err != nil {
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			discardStaged = false
 			e.deferUntilRetry(ctx, item, err)
 			return false
 		}
@@ -103,6 +114,10 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 			return true
 		}
 		if errors.Is(uploadErr, context.Canceled) || errors.Is(uploadErr, context.DeadlineExceeded) {
+			// The file is completely downloaded and verified. Deleting it here
+			// meant a blip on the Telegram side cost the whole download again,
+			// which is the single most expensive mistake this pipeline can make.
+			discardStaged = false
 			e.deferUntilRetry(ctx, item, uploadErr)
 			return false
 		}
@@ -118,7 +133,7 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 	// upload has returned only after tdrive committed every segment, and its
 	// file handle has already been closed. Remove the large local copy before
 	// any potentially slow cloud-side deletion or queue persistence.
-	retainStagedOnSuccess = retainStagedAfterSuccessfulUpload(
+	discardStaged = !retainStagedAfterSuccessfulUpload(
 		staged, item.ID, deleteLocalAfterUpload,
 	)
 	if item.DeleteAfter {
@@ -149,13 +164,28 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 }
 
 func (e *Engine) deferUntilLogin(ctx context.Context, item *Item) {
+	e.requeue(ctx, item, "等待重新登录阿里云盘")
+}
+
+func (e *Engine) deferUntilRetry(ctx context.Context, item *Item, err error) {
+	e.requeue(ctx, item, err.Error())
+}
+
+// requeue puts a transfer back in the queue to be attempted again.
+//
+// Downloaded is deliberately left alone. The staged chunks it counts are still
+// on disk and the next attempt resumes from them, so zeroing it would report a
+// file as un-downloaded while its bytes sat in the staging area — which is what
+// made an interrupted transfer look like it had restarted from nothing. Uploaded
+// does go back to zero: the segments are re-sent from the beginning, and the old
+// upload job is abandoned rather than resumed.
+func (e *Engine) requeue(ctx context.Context, item *Item, reason string) {
 	e.mu.Lock()
 	item.State = StatePending
 	item.Stage = StageIdle
-	item.Downloaded = 0
 	item.Uploaded = 0
 	item.UploadJobID = ""
-	item.Error = "等待重新登录阿里云盘"
+	item.Error = reason
 	item.FinishedAt = 0
 	item.resetSpeed()
 	e.markQueueDirtyLocked()
@@ -163,19 +193,16 @@ func (e *Engine) deferUntilLogin(ctx context.Context, item *Item) {
 	e.persistNow(ctx)
 }
 
-func (e *Engine) deferUntilRetry(ctx context.Context, item *Item, err error) {
-	e.mu.Lock()
-	item.State = StatePending
-	item.Stage = StageIdle
-	item.Downloaded = 0
-	item.Uploaded = 0
-	item.UploadJobID = ""
-	item.Error = err.Error()
-	item.FinishedAt = 0
-	item.resetSpeed()
-	e.markQueueDirtyLocked()
-	e.mu.Unlock()
-	e.persistNow(ctx)
+// discardStagedWork removes everything one queue item holds in the staging
+// area, including the resume checkpoint. It is used for transfers that will not
+// be attempted again, so the disk is not held by work nobody will finish.
+func (e *Engine) discardStagedWork(item *Item) {
+	if item == nil {
+		return
+	}
+	directory := itemStageDir(e.StageDir(), item.ID)
+	aliyunpan.DiscardPartialDownload(directory, item.RemotePath)
+	_ = os.RemoveAll(directory)
 }
 
 // stage downloads the cloud file onto local disk.
@@ -190,7 +217,7 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 	}
 	defer releaseDownload()
 	stageDir := e.StageDir()
-	releaseStage, err := e.reserveStageRoom(item.Size, stageDir, limits)
+	releaseStage, err := e.reserveStageRoom(item.ID, item.Size, stageDir, limits)
 	if err != nil {
 		return "", err
 	}
@@ -221,7 +248,10 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 		SliceParallel: slices,
 	}, item.Size, func(done int64) { e.noteDownload(item, done) })
 	if err != nil {
-		_ = os.RemoveAll(downloadDir)
+		// The partial download and its checkpoint stay where they are. Whether
+		// they are worth keeping depends on whether this item will be retried,
+		// which only the caller knows; deleting them here is what used to make
+		// every interrupted download start again from byte zero.
 		return "", err
 	}
 	// The completed file is now visible to stagedBytesAt, so the reservation

@@ -533,9 +533,15 @@
       }
       const STAGE_LABEL = {
         downloading: '下载中',
+        'waiting-upload': '等待上传',
         uploading: '上传中',
         finishing: '收尾中',
       }
+
+      // Stages whose progress is measured against Telegram rather than disk.
+      // Everything else — including a finished download waiting for an upload
+      // slot — is still described by how much of the file is on local disk.
+      const UPLOAD_STAGES = new Set(['uploading', 'finishing'])
 
       const state = {
         tab: localStorage.getItem('tdrive.aliyunpan.tab') || 'sync',
@@ -934,8 +940,10 @@
       function transferRow(row, now) {
         // The bar tracks whichever half is running: disk on the way in,
         // Telegram on the way out. Mixing them into one number would make a
-        // finished download look like a half-finished upload.
-        const measured = row.stage === 'downloading' ? row.downloaded : row.done
+        // finished download look like a half-finished upload. A row that is
+        // pending, queued, or holding a staged file keeps showing its download
+        // figure, so a transfer waiting its turn does not read as 0%.
+        const measured = UPLOAD_STAGES.has(row.stage) ? row.done : row.downloaded
         const percent = row.total > 0 ? Math.min(100, (measured / row.total) * 100) : 0
         const speed = liveSpeed(row, now)
         const expanded = state.expanded.has(row.id)

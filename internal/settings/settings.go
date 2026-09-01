@@ -42,10 +42,10 @@ type Settings struct {
 	// DeleteLocalAfterUpload removes the staged copy once tdrive has committed
 	// the upload. It defaults to true so older configurations do not gradually
 	// fill the staging disk after an upgrade.
-	DeleteLocalAfterUpload bool `json:"deleteLocalAfterUpload"`
-	Schedule                Schedule `json:"schedule"`
-	Quota                   Quota    `json:"quota"`
-	Jobs                    []Job    `json:"jobs"`
+	DeleteLocalAfterUpload bool     `json:"deleteLocalAfterUpload"`
+	Schedule               Schedule `json:"schedule"`
+	Quota                  Quota    `json:"quota"`
+	Jobs                   []Job    `json:"jobs"`
 }
 
 // Schedule decides when the engine is allowed to start new files.
@@ -105,15 +105,15 @@ type Job struct {
 const (
 	// DefaultDailyBytes is 20 GiB, comfortably under what a single Telegram
 	// account will tolerate in a day while still moving a useful amount.
-	DefaultDailyBytes    = 20 << 30
-	DefaultInterval      = 15
-	DefaultSegmentChunk  = 256 << 10
+	DefaultDailyBytes          = 20 << 30
+	DefaultInterval            = 15
+	DefaultSegmentChunk        = 256 << 10
 	DefaultDownloadConcurrency = 2
-	minIntervalMinutes   = 1
-	maxIntervalMinutes   = 24 * 60
-	maxExcludePatternLen = 512
-	maxDownloadConcurrency = 32
-	DefaultDriveName     = "backup"
+	minIntervalMinutes         = 1
+	maxIntervalMinutes         = 24 * 60
+	maxExcludePatternLen       = 512
+	maxDownloadConcurrency     = 32
+	DefaultDriveName           = "backup"
 )
 
 // Default is the document a fresh installation starts from. The schedule is

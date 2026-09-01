@@ -40,9 +40,9 @@ type CLI struct {
 	// snapshot first, so a multi-hour transfer cannot block the directory
 	// browser or corrupt the canonical token file.
 	downloadGate chan struct{}
-	runningMu       sync.Mutex
-	running         map[uint64]context.CancelFunc
-	nextRunID       uint64
+	runningMu    sync.Mutex
+	running      map[uint64]context.CancelFunc
+	nextRunID    uint64
 
 	// loginMu guards the interactive login session.
 	loginMu sync.Mutex
@@ -63,12 +63,12 @@ func New(dataDir, override string) *CLI {
 		managed = false
 	}
 	return &CLI{
-		binary:      binary,
-		configDir:   filepath.Join(dataDir, "config"),
-		managed:     managed,
-		commandGate: make(chan struct{}, 1),
+		binary:       binary,
+		configDir:    filepath.Join(dataDir, "config"),
+		managed:      managed,
+		commandGate:  make(chan struct{}, 1),
 		downloadGate: make(chan struct{}, 1),
-		running:     make(map[uint64]context.CancelFunc),
+		running:      make(map[uint64]context.CancelFunc),
 	}
 }
 

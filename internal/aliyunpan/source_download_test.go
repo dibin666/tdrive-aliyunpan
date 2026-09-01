@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,7 @@ func TestSourceDownloadUsesParallelRangesAndReportsAbsoluteProgress(t *testing.T
 		DriveID:       "drive-1",
 		SliceParallel: 3,
 		Retry:         2,
+		ChunkSize:     4,
 	}, int64(len(content)), func(done int64) {
 		progressMu.Lock()
 		progressValues = append(progressValues, done)
@@ -135,7 +137,7 @@ func TestSourceDownloadRefreshesExpiredDownloadURL(t *testing.T) {
 	}
 }
 
-func TestSourceDownloadCancellationCleansTemporaryFile(t *testing.T) {
+func TestSourceDownloadCancellationKeepsResumableState(t *testing.T) {
 	started := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -187,8 +189,183 @@ func TestSourceDownloadCancellationCleansTemporaryFile(t *testing.T) {
 	if _, err := os.Stat(staged); !os.IsNotExist(err) {
 		t.Fatalf("staged file still exists: %v", err)
 	}
-	if _, err := os.Stat(staged + downloadPartSuffix); !os.IsNotExist(err) {
-		t.Fatalf("partial file still exists: %v", err)
+	// The partial file and its checkpoint are what let the retry resume. The
+	// downloader does not know whether this transfer was abandoned or merely
+	// interrupted, so it keeps them; the queue decides.
+	partial := staged + downloadPartSuffix
+	if _, err := os.Stat(partial); err != nil {
+		t.Fatalf("partial file was discarded by a cancelled download: %v", err)
+	}
+	if _, err := os.Stat(checkpointPath(partial)); err != nil {
+		t.Fatalf("resume checkpoint was discarded by a cancelled download: %v", err)
+	}
+
+	DiscardPartialDownload(stageDir, "/file.bin")
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Fatalf("partial file survived an explicit discard: %v", err)
+	}
+	if _, err := os.Stat(checkpointPath(partial)); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint survived an explicit discard: %v", err)
+	}
+}
+
+// The point of the checkpoint is that an interrupted transfer costs the chunks
+// it lost, not the file. This drives a download that dies after one chunk and
+// then re-runs it against a server that refuses to serve anything already on
+// disk, so a resumed byte would show up as a failure rather than as a slow
+// success.
+func TestSourceDownloadResumesFromCheckpoint(t *testing.T) {
+	content := []byte("0123456789abcdef")
+	const chunkSize = 4
+	var servedRanges struct {
+		sync.Mutex
+		begins []int64
+	}
+	failAfterFirstChunk := true
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/adrive/v1.0/openFile/get_by_path":
+			writeJSONResponse(response, map[string]any{"drive_id": "drive-1", "file_id": "file-1", "name": "file.bin", "type": "file", "size": len(content)})
+		case "/adrive/v1.0/openFile/getDownloadUrl":
+			writeJSONResponse(response, map[string]string{"url": "http://" + request.Host + "/content"})
+		case "/content":
+			var begin, end int64
+			if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &begin, &end); err != nil {
+				response.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			servedRanges.Lock()
+			alreadyServed := len(servedRanges.begins)
+			servedRanges.begins = append(servedRanges.begins, begin)
+			servedRanges.Unlock()
+			if failAfterFirstChunk && alreadyServed >= 1 {
+				response.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", begin, end, len(content)))
+			response.WriteHeader(http.StatusPartialContent)
+			_, _ = response.Write(content[begin : end+1])
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client := New(t.TempDir(), "")
+	client.httpClient = server.Client()
+	client.openAPIURL = server.URL
+	client.setCredentials(accountCredentials{OpenAPIAccess: "access"})
+	stageDir := t.TempDir()
+	requestTemplate := DownloadRequest{
+		CloudPath:     "/file.bin",
+		StageDir:      stageDir,
+		DriveID:       "drive-1",
+		SliceParallel: 1,
+		Retry:         1,
+		ChunkSize:     chunkSize,
+	}
+
+	if _, err := client.Download(context.Background(), requestTemplate, int64(len(content)), nil); err == nil {
+		t.Fatal("first download should have failed after the server started refusing chunks")
+	}
+	servedRanges.Lock()
+	firstRun := append([]int64(nil), servedRanges.begins...)
+	servedRanges.begins = nil
+	servedRanges.Unlock()
+	if len(firstRun) == 0 || firstRun[0] != 0 {
+		t.Fatalf("first run served %v, want it to start at byte 0", firstRun)
+	}
+
+	failAfterFirstChunk = false
+	var resumedBaseline int64 = -1
+	staged, err := client.Download(context.Background(), requestTemplate, int64(len(content)), func(done int64) {
+		if resumedBaseline < 0 {
+			resumedBaseline = done
+		}
+	})
+	if err != nil {
+		t.Fatalf("resumed download: %v", err)
+	}
+	if resumedBaseline != chunkSize {
+		t.Fatalf("first reported progress = %d, want the %d resumed bytes", resumedBaseline, chunkSize)
+	}
+	servedRanges.Lock()
+	secondRun := append([]int64(nil), servedRanges.begins...)
+	servedRanges.Unlock()
+	for _, begin := range secondRun {
+		if begin == 0 {
+			t.Fatalf("resumed download re-fetched the completed first chunk: %v", secondRun)
+		}
+	}
+
+	got, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatalf("ReadFile staged: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("resumed content = %q, want %q", got, content)
+	}
+	if _, err := os.Stat(staged + downloadPartSuffix + downloadProgressSuffix); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint outlived a finished download: %v", err)
+	}
+}
+
+// A staged file that is already complete belongs to a download that succeeded
+// and an upload that did not. Fetching it again is the most expensive possible
+// way to produce a file that is sitting right there.
+func TestSourceDownloadReusesCompletedStagedFile(t *testing.T) {
+	content := []byte("abcdefgh")
+	var contentRequests int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/adrive/v1.0/openFile/get_by_path":
+			writeJSONResponse(response, map[string]any{"drive_id": "drive-1", "file_id": "file-1", "name": "file.bin", "type": "file", "size": len(content)})
+		case "/adrive/v1.0/openFile/getDownloadUrl":
+			writeJSONResponse(response, map[string]string{"url": "http://" + request.Host + "/content"})
+		case "/content":
+			atomic.AddInt32(&contentRequests, 1)
+			response.WriteHeader(http.StatusPartialContent)
+			_, _ = response.Write(content)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client := New(t.TempDir(), "")
+	client.httpClient = server.Client()
+	client.openAPIURL = server.URL
+	client.setCredentials(accountCredentials{OpenAPIAccess: "access"})
+	stageDir := t.TempDir()
+	staged := StagedPath(stageDir, "/file.bin")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(staged, content, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var lastProgress int64
+	got, err := client.Download(context.Background(), DownloadRequest{
+		CloudPath:     "/file.bin",
+		StageDir:      stageDir,
+		DriveID:       "drive-1",
+		SliceParallel: 1,
+	}, int64(len(content)), func(done int64) { lastProgress = done })
+	if err != nil {
+		t.Fatalf("Download with a complete staged file: %v", err)
+	}
+	if got != staged {
+		t.Fatalf("staged path = %q, want %q", got, staged)
+	}
+	if requests := atomic.LoadInt32(&contentRequests); requests != 0 {
+		t.Fatalf("content requests = %d, want the existing staged file reused", requests)
+	}
+	if lastProgress != int64(len(content)) {
+		t.Fatalf("progress = %d, want %d", lastProgress, len(content))
+	}
+	if StagedDownloadBytes(stageDir, "/file.bin", int64(len(content))) != int64(len(content)) {
+		t.Fatal("a complete staged file should be reported as fully downloaded")
 	}
 }
 
