@@ -179,6 +179,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 	server := newServer(t)
 	body := `{"schedule":{"enabled":true,"windowStart":"01:00","windowEnd":"07:00","intervalMinutes":20},
 	          "quota":{"dailyBytes":1073741824,"resetAt":"03:00"},
+	          "downloadConcurrency":4,"deleteLocalAfterUpload":false,
 	          "jobs":[{"id":"j1","name":"影视","enabled":true,"remotePath":"/a","targetPath":"/b"}]}`
 	response, err := server.Handle(context.Background(), request(http.MethodPut, "/api/settings", "admin-1", body))
 	if err != nil {
@@ -191,6 +192,30 @@ func TestSettingsRoundTrip(t *testing.T) {
 	read, _ := server.Handle(context.Background(), request(http.MethodGet, "/api/settings", "admin-1", ""))
 	if !strings.Contains(string(read.Body), `"windowStart":"01:00"`) {
 		t.Errorf("settings did not round-trip: %s", read.Body)
+	}
+	if !strings.Contains(string(read.Body), `"downloadConcurrency":4`) {
+		t.Errorf("download concurrency did not round-trip: %s", read.Body)
+	}
+	if !strings.Contains(string(read.Body), `"deleteLocalAfterUpload":false`) {
+		t.Errorf("local cleanup choice did not round-trip: %s", read.Body)
+	}
+}
+
+func TestSettingsPUTAppliesDefaultsForLegacyPayload(t *testing.T) {
+	server := newServer(t)
+	response, err := server.Handle(context.Background(), request(http.MethodPut, "/api/settings", "admin-1", `{}`))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if response.Status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Status, response.Body)
+	}
+	body := string(response.Body)
+	if !strings.Contains(body, `"downloadConcurrency":2`) {
+		t.Errorf("legacy payload did not receive the default download concurrency: %s", body)
+	}
+	if !strings.Contains(body, `"deleteLocalAfterUpload":true`) {
+		t.Errorf("legacy payload did not receive the safe local cleanup default: %s", body)
 	}
 }
 

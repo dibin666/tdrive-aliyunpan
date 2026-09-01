@@ -40,9 +40,10 @@ var ErrStageRoom = errors.New("暂存空间不足")
 var missingSegmentsPattern = regexp.MustCompile(`missing segments \[([0-9 ]*)\]`)
 
 // transfer runs one item end to end: stage it on disk, push it to Telegram,
-// commit, then clean up.
+// commit, then apply the configured local-copy policy.
 func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.RuntimeSettings) bool {
 	defer e.releaseReservation(item.Size)
+	deleteLocalAfterUpload := e.Settings().DeleteLocalAfterUpload
 
 	// Cancel interrupts this context. Every error branch below has to check for
 	// that first: a cancelled transfer fails with a context error like any other
@@ -74,10 +75,17 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		return true
 	}
 	// The staged copy is disk the drive is not managing, so it is removed on
-	// every exit path, successful or not.
-	defer func() { cleanupStaged(staged, item.ID) }()
+	// every unsuccessful exit path. A successful upload may retain it when the
+	// administrator has explicitly chosen to keep local copies.
+	retainStagedOnSuccess := false
+	defer func() {
+		if !retainStagedOnSuccess {
+			cleanupStaged(staged, item.ID)
+		}
+	}()
 
-	if err := e.upload(ctx, item, staged, limits); err != nil {
+	releaseUpload, err := e.acquireUploadSlot(ctx, limits.UploadConcurrency)
+	if err != nil {
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
@@ -88,12 +96,31 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		e.fail(ctx, item, err)
 		return true
 	}
+	uploadErr := e.upload(ctx, item, staged, limits)
+	releaseUpload()
+	if uploadErr != nil {
+		if e.stoppedByCancel(item.ID) {
+			return true
+		}
+		if errors.Is(uploadErr, context.Canceled) || errors.Is(uploadErr, context.DeadlineExceeded) {
+			e.deferUntilRetry(ctx, item, uploadErr)
+			return false
+		}
+		e.fail(ctx, item, uploadErr)
+		return true
+	}
 	if e.stoppedByCancel(item.ID) {
 		// The upload finished in the gap between the cancellation and this
 		// check. Deleting the cloud original and reporting success would both
 		// contradict a decision the operator has already made.
 		return true
 	}
+	// upload has returned only after tdrive committed every segment, and its
+	// file handle has already been closed. Remove the large local copy before
+	// any potentially slow cloud-side deletion or queue persistence.
+	retainStagedOnSuccess = retainStagedAfterSuccessfulUpload(
+		staged, item.ID, deleteLocalAfterUpload,
+	)
 	if item.DeleteAfter {
 		// Only reached after the drive has committed the file, so the cloud
 		// copy is never the last one standing.
@@ -157,6 +184,11 @@ func (e *Engine) stage(ctx context.Context, item *Item, limits hostapi.RuntimeSe
 	if cli == nil {
 		return "", errors.New("aliyunpan 尚未配置")
 	}
+	releaseDownload, err := e.acquireDownloadSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer releaseDownload()
 	stageDir := e.StageDir()
 	releaseStage, err := e.reserveStageRoom(item.Size, stageDir, limits)
 	if err != nil {
@@ -221,6 +253,19 @@ func cleanupStaged(staged, itemID string) {
 		}
 		dir = filepath.Dir(dir)
 	}
+}
+
+// retainStagedAfterSuccessfulUpload applies the global local-copy policy. It
+// returns whether the transfer's deferred cleanup should leave the staged file
+// alone; when deletion is requested, the deferred cleanup remains enabled as a
+// second attempt if the immediate removal encounters a transient filesystem
+// problem.
+func retainStagedAfterSuccessfulUpload(staged, itemID string, deleteLocalAfterUpload bool) bool {
+	if !deleteLocalAfterUpload {
+		return true
+	}
+	cleanupStaged(staged, itemID)
+	return false
 }
 
 // upload pushes the staged file into the drive, one segment at a time.

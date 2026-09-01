@@ -1077,7 +1077,12 @@
           field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage'),
           field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 的暂存上限'),
           field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '源码客户端的总下载限速，留空表示不限速'),
+          field('阿里云盘同时下载文件数', '<input class="input" id="aliyunpan-download-concurrency" type="number" min="1" max="32" step="1" value="' + ((state.settings && state.settings.downloadConcurrency) || 2) + '">', '限制同时从阿里云盘下载到本地的文件数，不影响 tdrive 自身的 Telegram 下载'),
           field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空使用第一个管理员" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归谁、占谁的配额'),
+          '<div><label class="switch"><input type="checkbox" id="delete-local-after-upload"' +
+            (!state.settings || state.settings.deleteLocalAfterUpload !== false ? ' checked' : '') +
+            '> 上传完成后立刻删除本地暂存文件</label>' +
+            '<div class="hint">关闭后成功上传的文件会保留在暂存目录；失败或取消的传输仍会清理。</div></div>',
           '</div>',
           '</div>',
 
@@ -1090,12 +1095,12 @@
           stat('上传分片', bytes(limits.uploadPartSize)),
           stat('上传线程', String(limits.uploadThreads)),
           stat('同时上传文件', String(limits.uploadConcurrency)),
-          stat('同时下载文件', String(limits.downloadConcurrency)),
+          stat('tdrive 同时下载文件', String(limits.downloadConcurrency)),
           stat('单文件下载连接', String(limits.maxDownloadConns)),
           stat('调用间隔', limits.rateLimitMillis > 0 ? limits.rateLimitMillis + ' ms' : '不限'),
           stat('tdrive 暂存上限', limits.cacheLimit > 0 ? bytes(limits.cacheLimit) : '不限'),
           '</div>',
-          '<div class="hint" style="margin-top:.5rem">要改这些，去 tdrive 的「设置 → 性能参数 / 存储与暂存」。同步不会自己另设一套。</div>',
+          '<div class="hint" style="margin-top:.5rem">上面的“阿里云盘同时下载文件数”是插件自己的源下载限制；这里的 tdrive 参数请到「设置 → 性能参数 / 存储与暂存」修改。</div>',
           '</div>',
         ].join('')
       }
@@ -1187,7 +1192,12 @@
       // form has to still be there underneath when the picker closes.
       function renderOverlay(force) {
         const overlay = document.getElementById('overlay')
-          const key = state.picker
+        const previousPicker = overlay.querySelector('.picker')
+        const previousModal = previousPicker ? overlay.querySelector('.modal') : null
+        const previousPickerPath = previousPicker ? previousPicker.dataset.pickerPath || '' : ''
+        const previousPickerScrollTop = previousPicker ? previousPicker.scrollTop : 0
+        const previousModalScrollTop = previousModal ? previousModal.scrollTop : 0
+        const key = state.picker
           ? ['picker', state.picker.request, state.picker.kind, state.picker.driveName, state.picker.path, state.picker.loading, state.picker.error, state.picker.chosen.size].join('|')
           : state.editing
             ? 'job|' + (state.editing.id || 'new') + '|' + ((state.editing.includeFiles || []).length)
@@ -1195,8 +1205,15 @@
         if (!force && key === overlayKey) return
         overlayKey = key
 
-        if (state.picker) overlay.innerHTML = pickerModal(state.picker)
-        else if (state.editing) overlay.innerHTML = jobModal(state.editing)
+        if (state.picker) {
+          overlay.innerHTML = pickerModal(state.picker)
+          const nextPicker = overlay.querySelector('.picker')
+          if (nextPicker && previousPicker && nextPicker.dataset.pickerPath === previousPickerPath) {
+            nextPicker.scrollTop = previousPickerScrollTop
+            const nextModal = overlay.querySelector('.modal')
+            if (nextModal) nextModal.scrollTop = previousModalScrollTop
+          }
+        } else if (state.editing) overlay.innerHTML = jobModal(state.editing)
         else overlay.innerHTML = ''
       }
 
@@ -1314,7 +1331,7 @@
               (chosen > 0 ? '已勾选 ' + chosen + ' 个文件' : files.length + ' 个文件') +
               '</span></div>'
             : '',
-          '<div class="picker">',
+          '<div class="picker" data-picker-path="' + esc(picker.path) + '">',
           picker.path !== '/'
             ? '<button data-picker-go="' + esc(parentOf(picker.path)) + '" type="button">.. 上一级</button>'
             : '',
@@ -1671,12 +1688,15 @@
         if (!state.settings) return
         const gib = Number(value('quota-gib') || 0)
         const stageGib = Number(value('stage-limit') || 0)
+        const downloadConcurrency = Math.round(Number(value('aliyunpan-download-concurrency') || 0))
         const next = {
           ...state.settings,
           stageDir: value('stage-dir'),
           stageLimitBytes: Math.round(stageGib * 1073741824),
           ownerUserId: value('owner'),
           downloadRate: value('download-rate'),
+          downloadConcurrency,
+          deleteLocalAfterUpload: checked('delete-local-after-upload'),
           schedule: {
             ...state.settings.schedule,
             enabled: checked('schedule-enabled'),

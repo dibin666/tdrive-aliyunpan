@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -180,6 +181,80 @@ func TestQuotaUnlimited(t *testing.T) {
 	}
 }
 
+func TestDownloadSlotRespectsConfiguredConcurrency(t *testing.T) {
+	engine := &Engine{settings: settings.Settings{DownloadConcurrency: 1}}
+	releaseFirst, acquireError := engine.acquireDownloadSlot(context.Background())
+	if acquireError != nil {
+		t.Fatalf("acquire first download slot: %v", acquireError)
+	}
+
+	blockedContext, cancelBlocked := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBlocked()
+	_, acquireError = engine.acquireDownloadSlot(blockedContext)
+	if !errors.Is(acquireError, context.DeadlineExceeded) {
+		t.Fatalf("second download slot error = %v, want deadline exceeded", acquireError)
+	}
+
+	releaseFirst()
+	releaseSecond, acquireError := engine.acquireDownloadSlot(context.Background())
+	if acquireError != nil {
+		t.Fatalf("acquire released download slot: %v", acquireError)
+	}
+	releaseSecond()
+}
+
+func TestDownloadSlotWakesWhenConfiguredLimitIncreases(t *testing.T) {
+	engine := &Engine{settings: settings.Settings{DownloadConcurrency: 1}}
+	releaseFirst, acquireError := engine.acquireDownloadSlot(context.Background())
+	if acquireError != nil {
+		t.Fatalf("acquire first download slot: %v", acquireError)
+	}
+
+	acquired := make(chan func(), 1)
+	acquireDone := make(chan error, 1)
+	go func() {
+		releaseSecond, waitError := engine.acquireDownloadSlot(context.Background())
+		if waitError == nil {
+			acquired <- releaseSecond
+		}
+		acquireDone <- waitError
+	}()
+
+	engine.applySettings(settings.Settings{DownloadConcurrency: 2})
+	select {
+	case waitError := <-acquireDone:
+		if waitError != nil {
+			t.Fatalf("acquire after increasing limit: %v", waitError)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download slot was not woken after increasing the configured limit")
+	}
+
+	select {
+	case releaseSecond := <-acquired:
+		releaseSecond()
+	case <-time.After(time.Second):
+		t.Fatal("download slot acquisition did not return its release function")
+	}
+	releaseFirst()
+}
+
+func TestUploadSlotRespectsHostConcurrency(t *testing.T) {
+	engine := &Engine{}
+	releaseFirst, acquireError := engine.acquireUploadSlot(context.Background(), 1)
+	if acquireError != nil {
+		t.Fatalf("acquire first upload slot: %v", acquireError)
+	}
+
+	blockedContext, cancelBlocked := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBlocked()
+	_, acquireError = engine.acquireUploadSlot(blockedContext, 1)
+	if !errors.Is(acquireError, context.DeadlineExceeded) {
+		t.Fatalf("second upload slot error = %v, want deadline exceeded", acquireError)
+	}
+	releaseFirst()
+}
+
 func TestItemTargetPath(t *testing.T) {
 	if got := (&Item{TargetDir: "/", Name: "a.mkv"}).TargetPath(); got != "/a.mkv" {
 		t.Errorf("root target = %q", got)
@@ -197,6 +272,45 @@ func TestItemStageDirIsUniquePerQueueItem(t *testing.T) {
 	}
 	if first != "/stage/"+stageItemsDir+"/item-a" {
 		t.Fatalf("item stage directory = %q", first)
+	}
+}
+
+func TestSuccessfulUploadLocalCleanupPolicy(t *testing.T) {
+	cases := []struct {
+		name                 string
+		deleteLocalAfterUpload bool
+		wantRetained         bool
+	}{
+		{name: "delete immediately", deleteLocalAfterUpload: true, wantRetained: false},
+		{name: "retain when disabled", deleteLocalAfterUpload: false, wantRetained: true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			stageRoot := t.TempDir()
+			itemDirectory := itemStageDir(stageRoot, "item-a")
+			stagedPath := filepath.Join(itemDirectory, "file.bin")
+			if err := os.MkdirAll(itemDirectory, 0o750); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.WriteFile(stagedPath, []byte("staged"), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			gotRetained := retainStagedAfterSuccessfulUpload(
+				stagedPath, "item-a", testCase.deleteLocalAfterUpload,
+			)
+			if gotRetained != testCase.wantRetained {
+				t.Fatalf("retained = %v, want %v", gotRetained, testCase.wantRetained)
+			}
+			_, statError := os.Stat(stagedPath)
+			if testCase.wantRetained && statError != nil {
+				t.Fatalf("retained staged file stat: %v", statError)
+			}
+			if !testCase.wantRetained && !os.IsNotExist(statError) {
+				t.Fatalf("staged file error = %v, want not-exist", statError)
+			}
+		})
 	}
 }
 

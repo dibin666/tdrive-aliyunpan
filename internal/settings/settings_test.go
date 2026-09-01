@@ -106,6 +106,9 @@ func TestNormalizeDefaults(t *testing.T) {
 	if err := document.Normalize(); err != nil {
 		t.Fatalf("Normalize: %v", err)
 	}
+	if document.DownloadConcurrency != DefaultDownloadConcurrency {
+		t.Errorf("download concurrency = %d, want %d", document.DownloadConcurrency, DefaultDownloadConcurrency)
+	}
 	if document.Schedule.IntervalMinutes != DefaultInterval {
 		t.Errorf("interval = %d", document.Schedule.IntervalMinutes)
 	}
@@ -114,6 +117,22 @@ func TestNormalizeDefaults(t *testing.T) {
 	}
 	if document.Jobs == nil {
 		t.Error("jobs should be an empty slice, not nil, so the UI renders a list")
+	}
+
+	defaults := Default()
+	if !defaults.DeleteLocalAfterUpload {
+		t.Error("new installations should delete successful local staging files by default")
+	}
+}
+
+func TestNormalizeKeepsExplicitLocalRetentionChoice(t *testing.T) {
+	document := Default()
+	document.DeleteLocalAfterUpload = false
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if document.DeleteLocalAfterUpload {
+		t.Error("Normalize should keep an explicit request to retain local staging files")
 	}
 }
 
@@ -131,6 +150,8 @@ func TestNormalizeRejections(t *testing.T) {
 	cases := map[string]Settings{
 		"相对暂存路径":   {StageDir: "stage"},
 		"负配额":      {Quota: Quota{DailyBytes: -1}},
+		"负阿里云盘并发": {DownloadConcurrency: -1},
+		"超出阿里云盘并发": {DownloadConcurrency: maxDownloadConcurrency + 1},
 		"畸形时刻":     {Schedule: Schedule{WindowStart: "25:00"}},
 		"畸形重置时刻":   {Quota: Quota{ResetAt: "7:5"}},
 		"越界间隔":     {Schedule: Schedule{IntervalMinutes: 99999}},

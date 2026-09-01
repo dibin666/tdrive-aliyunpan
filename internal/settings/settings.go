@@ -34,10 +34,18 @@ type Settings struct {
 	OwnerUserID string `json:"ownerUserId"`
 	// DownloadRate configures the source client's aggregate download limiter,
 	// e.g. "2MB". Empty means unlimited.
-	DownloadRate string   `json:"downloadRate"`
-	Schedule     Schedule `json:"schedule"`
-	Quota        Quota    `json:"quota"`
-	Jobs         []Job    `json:"jobs"`
+	DownloadRate string `json:"downloadRate"`
+	// DownloadConcurrency limits how many files may be downloaded from Aliyun
+	// Drive into the local staging area at once. It is independent of tdrive's
+	// Telegram download concurrency.
+	DownloadConcurrency int `json:"downloadConcurrency"`
+	// DeleteLocalAfterUpload removes the staged copy once tdrive has committed
+	// the upload. It defaults to true so older configurations do not gradually
+	// fill the staging disk after an upgrade.
+	DeleteLocalAfterUpload bool `json:"deleteLocalAfterUpload"`
+	Schedule                Schedule `json:"schedule"`
+	Quota                   Quota    `json:"quota"`
+	Jobs                    []Job    `json:"jobs"`
 }
 
 // Schedule decides when the engine is allowed to start new files.
@@ -100,9 +108,11 @@ const (
 	DefaultDailyBytes    = 20 << 30
 	DefaultInterval      = 15
 	DefaultSegmentChunk  = 256 << 10
+	DefaultDownloadConcurrency = 2
 	minIntervalMinutes   = 1
 	maxIntervalMinutes   = 24 * 60
 	maxExcludePatternLen = 512
+	maxDownloadConcurrency = 32
 	DefaultDriveName     = "backup"
 )
 
@@ -111,9 +121,11 @@ const (
 // says what to move.
 func Default() Settings {
 	return Settings{
-		Schedule: Schedule{Enabled: true, IntervalMinutes: DefaultInterval},
-		Quota:    Quota{DailyBytes: DefaultDailyBytes, ResetAt: "00:00"},
-		Jobs:     []Job{},
+		DownloadConcurrency:    DefaultDownloadConcurrency,
+		DeleteLocalAfterUpload: true,
+		Schedule:               Schedule{Enabled: true, IntervalMinutes: DefaultInterval},
+		Quota:                  Quota{DailyBytes: DefaultDailyBytes, ResetAt: "00:00"},
+		Jobs:                   []Job{},
 	}
 }
 
@@ -142,6 +154,12 @@ func (s *Settings) Normalize() error {
 	}
 	s.OwnerUserID = strings.TrimSpace(s.OwnerUserID)
 	s.DownloadRate = strings.TrimSpace(s.DownloadRate)
+	if s.DownloadConcurrency == 0 {
+		s.DownloadConcurrency = DefaultDownloadConcurrency
+	}
+	if s.DownloadConcurrency < 1 || s.DownloadConcurrency > maxDownloadConcurrency {
+		return fmt.Errorf("阿里云盘同时下载数必须在 1~%d 之间", maxDownloadConcurrency)
+	}
 
 	if s.Schedule.IntervalMinutes == 0 {
 		s.Schedule.IntervalMinutes = DefaultInterval

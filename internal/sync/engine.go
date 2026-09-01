@@ -47,18 +47,20 @@ type Engine struct {
 	// under it.
 	dataDir string
 
-	mu            sync.Mutex
-	settings      settings.Settings
-	queue         []*Item
-	quota         QuotaState
-	active        int
-	reserved      int64
-	stageReserved int64
-	lastScan      time.Time
-	scanning      bool
-	scanError     string
-	paused        bool
-	stopping      bool
+	mu             sync.Mutex
+	settings       settings.Settings
+	queue          []*Item
+	quota          QuotaState
+	active         int
+	downloadActive int
+	uploadActive   int
+	reserved       int64
+	stageReserved  int64
+	lastScan       time.Time
+	scanning       bool
+	scanError      string
+	paused         bool
+	stopping       bool
 	// runCtx is the plugin-lifetime context. HTTP-triggered background work
 	// uses it instead of the short-lived request context, but still stops when
 	// the host shuts the plugin down.
@@ -85,6 +87,9 @@ type Engine struct {
 	// running counts in-flight transfers so Close can wait for them.
 	workers sync.WaitGroup
 	runDone chan struct{}
+	// slotChanged wakes transfers waiting for a source-download or tdrive-upload
+	// slot when a running transfer finishes or the configured limit changes.
+	slotChanged chan struct{}
 
 	// probeMu guards the cached aliyunpan account. It is cached because the
 	// source client makes a network call, which must not happen on every page
@@ -99,15 +104,16 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Engine{
-		host:       host,
-		dataDir:    dataDir,
-		logger:     logger,
-		settings:   settings.Default(),
-		queue:      []*Item{},
-		cancels:    make(map[string]context.CancelFunc),
-		cancelling: make(map[string]bool),
-		wake:       make(chan struct{}, 1),
-		runDone:    make(chan struct{}),
+		host:        host,
+		dataDir:     dataDir,
+		logger:      logger,
+		settings:    settings.Default(),
+		queue:       []*Item{},
+		cancels:     make(map[string]context.CancelFunc),
+		cancelling:  make(map[string]bool),
+		wake:        make(chan struct{}, 1),
+		runDone:     make(chan struct{}),
+		slotChanged: make(chan struct{}),
 	}
 }
 
@@ -250,6 +256,7 @@ func (e *Engine) applySettings(next settings.Settings) {
 	e.mu.Lock()
 	oldJobs := e.settings.Jobs
 	changedJobs := !reflect.DeepEqual(oldJobs, next.Jobs)
+	downloadConcurrencyChanged := e.settings.DownloadConcurrency != next.DownloadConcurrency
 	e.settings = next
 	if changedJobs {
 		stale := changedJobIDs(oldJobs, next.Jobs)
@@ -266,6 +273,9 @@ func (e *Engine) applySettings(next settings.Settings) {
 				e.markQueueDirtyLocked()
 			}
 		}
+	}
+	if downloadConcurrencyChanged {
+		e.signalTransferSlotChangeLocked()
 	}
 	e.mu.Unlock()
 }
@@ -452,21 +462,28 @@ func (e *Engine) rollQuota(ctx context.Context) {
 	}
 }
 
-// dispatch starts as many transfers as the drive's own upload concurrency and
-// the daily quota allow.
+// dispatch starts as many transfers as the larger of the source-download and
+// tdrive-upload limits allows. The individual stages have their own gates, so
+// a faster source does not make Telegram uploads exceed the host setting.
 func (e *Engine) dispatch(ctx context.Context) {
 	limits, err := e.host.Settings(ctx)
 	if err != nil {
 		e.logger.Printf("读取 tdrive 运行参数失败: %v", err)
 		return
 	}
-	// Whole-file parallelism follows tdrive's own setting. Inside a file the
-	// segments stay sequential: UploadThreads, UploadPartSize and RateLimit
-	// already parallelise and pace the Telegram side, and a second layer of
-	// concurrency here would only fight them.
-	workers := limits.UploadConcurrency
-	if workers < 1 {
-		workers = 1
+	uploadWorkers := limits.UploadConcurrency
+	if uploadWorkers < 1 {
+		uploadWorkers = 1
+	}
+	e.mu.Lock()
+	downloadWorkers := e.settings.DownloadConcurrency
+	e.mu.Unlock()
+	if downloadWorkers < 1 {
+		downloadWorkers = settings.DefaultDownloadConcurrency
+	}
+	workers := uploadWorkers
+	if downloadWorkers > workers {
+		workers = downloadWorkers
 	}
 
 	for {
@@ -545,6 +562,101 @@ func (e *Engine) finishActive() {
 		e.active = 0
 	}
 	e.mu.Unlock()
+}
+
+// acquireDownloadSlot waits until this transfer may download a file from
+// Aliyun Drive. Waiting is interruptible so cancelling a queued transfer does
+// not leave a goroutine behind until another download finishes.
+func (e *Engine) acquireDownloadSlot(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		e.mu.Lock()
+		limit := e.settings.DownloadConcurrency
+		if limit < 1 {
+			limit = settings.DefaultDownloadConcurrency
+		}
+		if e.downloadActive < limit {
+			e.downloadActive++
+			e.mu.Unlock()
+			var releaseOnce sync.Once
+			return func() {
+				releaseOnce.Do(func() {
+					e.mu.Lock()
+					if e.downloadActive > 0 {
+						e.downloadActive--
+					}
+					e.signalTransferSlotChangeLocked()
+					e.mu.Unlock()
+				})
+			}, nil
+		}
+		changed := e.transferSlotChangeChannelLocked()
+		e.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// acquireUploadSlot limits the tdrive upload portion independently from source
+// downloads. The host setting is captured for this transfer by dispatch and
+// refreshed for newly dispatched transfers on the next scheduler pass.
+func (e *Engine) acquireUploadSlot(ctx context.Context, limit int) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	for {
+		e.mu.Lock()
+		if e.uploadActive < limit {
+			e.uploadActive++
+			e.mu.Unlock()
+			var releaseOnce sync.Once
+			return func() {
+				releaseOnce.Do(func() {
+					e.mu.Lock()
+					if e.uploadActive > 0 {
+						e.uploadActive--
+					}
+					e.signalTransferSlotChangeLocked()
+					e.mu.Unlock()
+				})
+			}, nil
+		}
+		changed := e.transferSlotChangeChannelLocked()
+		e.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// transferSlotChangeChannelLocked returns the current notification channel.
+// It is replaced whenever a slot becomes available so every waiter can safely
+// observe the same change without holding the engine mutex while blocking.
+func (e *Engine) transferSlotChangeChannelLocked() <-chan struct{} {
+	if e.slotChanged == nil {
+		e.slotChanged = make(chan struct{})
+	}
+	return e.slotChanged
+}
+
+func (e *Engine) signalTransferSlotChangeLocked() {
+	if e.slotChanged == nil {
+		e.slotChanged = make(chan struct{})
+	}
+	close(e.slotChanged)
+	e.slotChanged = make(chan struct{})
 }
 
 // releaseReservation returns a finished item's unspent allowance.

@@ -77,7 +77,11 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		case http.MethodGet:
 			return okJSON(s.engine.ReloadSettings(ctx))
 		case http.MethodPut:
-			var next settings.Settings
+			// Decode into the defaults so configurations written by an older page
+			// receive safe values for newly added fields. JSON still overwrites
+			// those defaults when the caller explicitly sends false or another
+			// zero-value that is meaningful for an existing setting.
+			next := settings.Default()
 			if err := json.Unmarshal(request.Body, &next); err != nil {
 				return status(http.StatusBadRequest, "配置不是合法的 JSON: "+err.Error()), nil
 			}
