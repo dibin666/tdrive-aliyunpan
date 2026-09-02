@@ -267,3 +267,75 @@ func TestNormalizeAcceptsPickedFilesUnderTheRoot(t *testing.T) {
 		t.Fatalf("Normalize: %v", err)
 	}
 }
+
+// A configuration written before the retry section existed has no retry object
+// at all. Normalize has to fill it in rather than leave a policy of zero
+// attempts, which would fail every transfer on its first error.
+func TestNormalizeFillsInARetryPolicy(t *testing.T) {
+	document := Default()
+	document.Retry = Retry{}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if document.Retry.MaxAttempts != DefaultRetryAttempts {
+		t.Errorf("maxAttempts = %d, want %d", document.Retry.MaxAttempts, DefaultRetryAttempts)
+	}
+	if document.Retry.InitialSeconds != DefaultRetryInitialSeconds {
+		t.Errorf("initialSeconds = %d, want %d", document.Retry.InitialSeconds, DefaultRetryInitialSeconds)
+	}
+	if document.Retry.MaxSeconds != DefaultRetryMaxSeconds {
+		t.Errorf("maxSeconds = %d, want %d", document.Retry.MaxSeconds, DefaultRetryMaxSeconds)
+	}
+}
+
+func TestNormalizeRejectsAnUnusableRetryPolicy(t *testing.T) {
+	for name, retry := range map[string]Retry{
+		"negative attempts":   {MaxAttempts: -1, InitialSeconds: 30, MaxSeconds: 1800},
+		"too many attempts":   {MaxAttempts: 1000, InitialSeconds: 30, MaxSeconds: 1800},
+		"negative interval":   {MaxAttempts: 5, InitialSeconds: -1, MaxSeconds: 1800},
+		"absurd interval":     {MaxAttempts: 5, InitialSeconds: 30, MaxSeconds: 90000},
+		"ceiling below floor": {MaxAttempts: 5, InitialSeconds: 600, MaxSeconds: 60},
+	} {
+		document := Default()
+		document.Retry = retry
+		if err := document.Normalize(); err == nil {
+			t.Errorf("%s: expected the policy to be rejected", name)
+		}
+	}
+}
+
+// 1 attempt is how an operator turns automatic retries off, so it has to be
+// accepted rather than corrected up to the default.
+func TestRetryAllowsBeingTurnedOff(t *testing.T) {
+	document := Default()
+	document.Retry = Retry{MaxAttempts: 1, InitialSeconds: 30, MaxSeconds: 1800}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if document.Retry.MaxAttempts != 1 {
+		t.Fatalf("maxAttempts = %d, want the operator's 1 to be kept", document.Retry.MaxAttempts)
+	}
+	if document.Retry.Allows(1) {
+		t.Error("a single-attempt policy must not schedule a second attempt")
+	}
+}
+
+func TestRetryBackoffDoublesAndIsCapped(t *testing.T) {
+	retry := Retry{MaxAttempts: 10, InitialSeconds: 30, MaxSeconds: 300}
+	for attempts, want := range map[int]time.Duration{
+		1: 30 * time.Second,
+		2: 60 * time.Second,
+		3: 120 * time.Second,
+		4: 240 * time.Second,
+		5: 300 * time.Second,
+		9: 300 * time.Second,
+	} {
+		if got := retry.Backoff(attempts); got != want {
+			t.Errorf("Backoff(%d) = %s, want %s", attempts, got, want)
+		}
+	}
+	// A large attempt count must not overflow its way back to a short wait.
+	if got := retry.Backoff(1000); got != 300*time.Second {
+		t.Errorf("Backoff(1000) = %s, want the ceiling", got)
+	}
+}

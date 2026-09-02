@@ -140,7 +140,7 @@ func resolveDriveForScan(kind string, drives []aliyunpan.Drive) (aliyunpan.Drive
 }
 
 func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.Job, selected ...aliyunpan.Drive) error {
-	drive := aliyunpan.Drive{}
+	var drive aliyunpan.Drive
 	if len(selected) > 0 {
 		drive = selected[0]
 	} else {

@@ -43,9 +43,57 @@ type Settings struct {
 	// the upload. It defaults to true so older configurations do not gradually
 	// fill the staging disk after an upgrade.
 	DeleteLocalAfterUpload bool     `json:"deleteLocalAfterUpload"`
+	Retry                  Retry    `json:"retry"`
 	Schedule               Schedule `json:"schedule"`
 	Quota                  Quota    `json:"quota"`
 	Jobs                   []Job    `json:"jobs"`
+}
+
+// Retry decides how hard a broken transfer is tried again before it is called a
+// failure.
+//
+// Almost everything that stops a transfer here is temporary — a dropped
+// connection, an expired link, a Telegram hiccup — and the download it already
+// paid for is sitting on disk. Giving up on the first error meant an operator
+// had to notice and press a button before any of that work was used.
+type Retry struct {
+	// MaxAttempts counts the first try. 1 therefore means "do not retry", and
+	// only a value above it schedules another attempt.
+	MaxAttempts int `json:"maxAttempts"`
+	// InitialSeconds is the wait before the second attempt. Each further
+	// attempt doubles it, up to MaxSeconds.
+	InitialSeconds int `json:"initialSeconds"`
+	MaxSeconds     int `json:"maxSeconds"`
+}
+
+// Backoff is how long to wait before the given attempt number is started again.
+// attempts is how many have already been made, so the first retry is attempts=1
+// and waits InitialSeconds.
+func (r Retry) Backoff(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	initial := time.Duration(r.InitialSeconds) * time.Second
+	maximum := time.Duration(r.MaxSeconds) * time.Second
+	wait := initial
+	for step := 1; step < attempts; step++ {
+		wait *= 2
+		if wait >= maximum {
+			// Doubling a large value repeatedly would overflow long before the
+			// attempt counter ran out.
+			return maximum
+		}
+	}
+	if wait > maximum {
+		return maximum
+	}
+	return wait
+}
+
+// Allows reports whether a transfer that has been tried this many times may be
+// tried again.
+func (r Retry) Allows(attempts int) bool {
+	return attempts < r.MaxAttempts
 }
 
 // Schedule decides when the engine is allowed to start new files.
@@ -114,6 +162,18 @@ const (
 	maxExcludePatternLen       = 512
 	maxDownloadConcurrency     = 32
 	DefaultDriveName           = "backup"
+
+	// DefaultRetryAttempts covers the outages that clear on their own within
+	// the roughly one hour the default backoff spans, without leaving a file
+	// that is genuinely broken cycling forever.
+	DefaultRetryAttempts = 5
+	// DefaultRetryInitialSeconds is long enough that a retry does not land in
+	// the middle of the same blip, and short enough to be invisible on a
+	// transfer that takes minutes anyway.
+	DefaultRetryInitialSeconds = 30
+	DefaultRetryMaxSeconds     = 30 * 60
+	maxRetryAttempts           = 100
+	maxRetryBackoffSeconds     = 24 * 60 * 60
 )
 
 // Default is the document a fresh installation starts from. The schedule is
@@ -123,9 +183,14 @@ func Default() Settings {
 	return Settings{
 		DownloadConcurrency:    DefaultDownloadConcurrency,
 		DeleteLocalAfterUpload: true,
-		Schedule:               Schedule{Enabled: true, IntervalMinutes: DefaultInterval},
-		Quota:                  Quota{DailyBytes: DefaultDailyBytes, ResetAt: "00:00"},
-		Jobs:                   []Job{},
+		Retry: Retry{
+			MaxAttempts:    DefaultRetryAttempts,
+			InitialSeconds: DefaultRetryInitialSeconds,
+			MaxSeconds:     DefaultRetryMaxSeconds,
+		},
+		Schedule: Schedule{Enabled: true, IntervalMinutes: DefaultInterval},
+		Quota:    Quota{DailyBytes: DefaultDailyBytes, ResetAt: "00:00"},
+		Jobs:     []Job{},
 	}
 }
 
@@ -159,6 +224,9 @@ func (s *Settings) Normalize() error {
 	}
 	if s.DownloadConcurrency < 1 || s.DownloadConcurrency > maxDownloadConcurrency {
 		return fmt.Errorf("阿里云盘同时下载数必须在 1~%d 之间", maxDownloadConcurrency)
+	}
+	if err := s.Retry.normalize(); err != nil {
+		return err
 	}
 
 	if s.Schedule.IntervalMinutes == 0 {
@@ -196,6 +264,35 @@ func (s *Settings) Normalize() error {
 			return fmt.Errorf("任务 ID 重复: %s", job.ID)
 		}
 		seen[job.ID] = true
+	}
+	return nil
+}
+
+// normalize fills in a retry policy that a document written before this
+// setting existed does not have. A zero means "unset" rather than "off",
+// following every other numeric field here; an operator who wants no retries
+// at all writes 1, which is one attempt and no more.
+func (r *Retry) normalize() error {
+	if r.MaxAttempts == 0 {
+		r.MaxAttempts = DefaultRetryAttempts
+	}
+	if r.InitialSeconds == 0 {
+		r.InitialSeconds = DefaultRetryInitialSeconds
+	}
+	if r.MaxSeconds == 0 {
+		r.MaxSeconds = DefaultRetryMaxSeconds
+	}
+	if r.MaxAttempts < 1 || r.MaxAttempts > maxRetryAttempts {
+		return fmt.Errorf("失败重试次数必须在 1~%d 之间", maxRetryAttempts)
+	}
+	if r.InitialSeconds < 1 || r.InitialSeconds > maxRetryBackoffSeconds {
+		return fmt.Errorf("首次重试间隔必须在 1~%d 秒之间", maxRetryBackoffSeconds)
+	}
+	if r.MaxSeconds < 1 || r.MaxSeconds > maxRetryBackoffSeconds {
+		return fmt.Errorf("最大重试间隔必须在 1~%d 秒之间", maxRetryBackoffSeconds)
+	}
+	if r.MaxSeconds < r.InitialSeconds {
+		return errors.New("最大重试间隔不能小于首次重试间隔")
 	}
 	return nil
 }

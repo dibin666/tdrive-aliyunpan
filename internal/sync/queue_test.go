@@ -13,6 +13,7 @@ func newQueueEngine(items ...*Item) *Engine {
 		queue:      items,
 		cancels:    make(map[string]context.CancelFunc),
 		cancelling: make(map[string]bool),
+		deleting:   make(map[string]int),
 	}
 }
 

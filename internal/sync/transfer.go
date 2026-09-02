@@ -2,8 +2,10 @@ package sync
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,15 +54,18 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 	ctx, release := e.watchItem(ctx, item.ID)
 	defer release()
 
-	// Partial work is kept for anything that will be tried again, and thrown
-	// away for anything that will not. A transfer that is requeued — because a
-	// token expired, a context was cancelled, or the staging area was briefly
-	// full — resumes from the chunks already on disk, which is the difference
-	// between retrying a file and downloading it a second time. A transfer that
-	// failed for good, or that somebody cancelled, leaves nothing behind.
+	// Partial work is only thrown away on the two occasions somebody has
+	// decided it is not wanted: an explicit cancellation, and a successful
+	// upload under a policy that asks for the local copy to go.
+	//
+	// A failure — of any kind, transient or final — keeps it. The bytes on disk
+	// are the expensive half of this pipeline, and deleting them meant a blip on
+	// the Telegram side cost the whole download again. What is left behind is
+	// visible and removable on the 下载文件 page, and the startup sweep collects
+	// anything the queue no longer refers to.
 	discardStaged := true
 	defer func() {
-		if discardStaged {
+		if discardStaged || e.stoppedByCancel(item.ID) {
 			e.discardStagedWork(item)
 		}
 	}()
@@ -70,27 +75,24 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
+		discardStaged = false
 		if errors.Is(err, aliyunpan.ErrNotLoggedIn) {
-			discardStaged = false
 			e.invalidateProbe()
 			e.requestProbeRefresh()
 			e.deferUntilLogin(ctx, item)
 			return false
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			discardStaged = false
-			e.deferUntilRetry(ctx, item, err)
-			return false
-		}
 		if errors.Is(err, ErrStageRoom) {
 			// Nothing was downloaded, but an earlier attempt's chunks may still
 			// be there and are exactly what makes the retry cheap enough to fit.
-			discardStaged = false
-			e.deferUntilRetry(ctx, item, err)
+			e.deferUntilResource(ctx, item, err)
 			return false
 		}
-		e.fail(ctx, item, err)
-		return true
+		if permanentTransferError(err) {
+			e.fail(ctx, item, err)
+			return true
+		}
+		return e.retryLater(ctx, item, err)
 	}
 
 	e.setStage(item, StageWaitingUpload)
@@ -99,13 +101,8 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			discardStaged = false
-			e.deferUntilRetry(ctx, item, err)
-			return false
-		}
-		e.fail(ctx, item, err)
-		return true
+		discardStaged = false
+		return e.retryLater(ctx, item, err)
 	}
 	uploadErr := e.upload(ctx, item, staged, limits)
 	releaseUpload()
@@ -113,16 +110,10 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		if e.stoppedByCancel(item.ID) {
 			return true
 		}
-		if errors.Is(uploadErr, context.Canceled) || errors.Is(uploadErr, context.DeadlineExceeded) {
-			// The file is completely downloaded and verified. Deleting it here
-			// meant a blip on the Telegram side cost the whole download again,
-			// which is the single most expensive mistake this pipeline can make.
-			discardStaged = false
-			e.deferUntilRetry(ctx, item, uploadErr)
-			return false
-		}
-		e.fail(ctx, item, uploadErr)
-		return true
+		// The file is completely downloaded and verified, so every upload error
+		// is worth another attempt against the copy already on disk.
+		discardStaged = false
+		return e.retryLater(ctx, item, uploadErr)
 	}
 	if e.stoppedByCancel(item.ID) {
 		// The upload finished in the gap between the cancellation and this
@@ -130,6 +121,15 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		// contradict a decision the operator has already made.
 		return true
 	}
+	e.setStage(item, StageFinishing)
+	if !e.complete(ctx, item) {
+		discardStaged = false
+		if !e.stoppedByCancel(item.ID) {
+			e.deferUntilResource(ctx, item, errors.New("保存完成状态失败，稍后重试"))
+		}
+		return true
+	}
+
 	// upload has returned only after tdrive committed every segment, and its
 	// file handle has already been closed. Remove the large local copy before
 	// any potentially slow cloud-side deletion or queue persistence.
@@ -137,41 +137,156 @@ func (e *Engine) transfer(ctx context.Context, item *Item, limits hostapi.Runtim
 		staged, item.ID, deleteLocalAfterUpload,
 	)
 	if item.DeleteAfter {
-		// Only reached after the drive has committed the file, so the cloud
-		// copy is never the last one standing.
-		if cli := e.CLI(); cli != nil {
-			drive, resolveErr := cli.ResolveDrive(ctx, item.DriveName)
-			if resolveErr != nil {
-				e.logger.Printf("解析删除目标网盘失败: %v", resolveErr)
-			} else {
-				var removeErr error
-				if item.FileID != "" {
-					removeErr = cli.RemoveByID(ctx, drive.ID, item.FileID)
-					if errors.Is(removeErr, aliyunpan.ErrPathNotFound) {
-						removeErr = cli.Remove(ctx, item.RemotePath, drive.ID)
-					}
-				} else {
-					removeErr = cli.Remove(ctx, item.RemotePath, drive.ID)
-				}
-				if removeErr != nil {
-					e.logger.Printf("删除云端 %s 失败: %v", item.RemotePath, removeErr)
+		for retry := 0; retry < 3; retry++ {
+			if err := e.removeCloudOriginal(ctx, item); err == nil {
+				e.mu.Lock()
+				item.DeleteAfter = false
+				e.markQueueDirtyLocked()
+				e.mu.Unlock()
+				break
+			}
+			if retry < 2 {
+				select {
+				case <-ctx.Done():
+					return true
+				case <-time.After(time.Duration(1<<retry) * time.Second):
 				}
 			}
 		}
 	}
-	e.complete(ctx, item)
 	return true
 }
 
+// removeCloudOriginal deletes the source file from Aliyun Drive after tdrive
+// has committed every segment.
+func (e *Engine) removeCloudOriginal(ctx context.Context, item *Item) error {
+	if cli := e.CLI(); cli != nil {
+		drive, resolveErr := cli.ResolveDrive(ctx, item.DriveName)
+		if resolveErr != nil {
+			e.logf("解析删除目标网盘失败: %v", resolveErr)
+			return resolveErr
+		}
+		var removeErr error
+		if item.FileID != "" {
+			removeErr = cli.RemoveByID(ctx, drive.ID, item.FileID)
+		} else {
+			removeErr = cli.Remove(ctx, item.RemotePath, drive.ID)
+		}
+		if removeErr != nil && !errors.Is(removeErr, aliyunpan.ErrPathNotFound) {
+			e.logf("删除云端 %s 失败: %v", item.RemotePath, removeErr)
+			return removeErr
+		}
+	}
+	return nil
+}
+
+// resourceWait is how long a transfer that could not start for want of a login
+// or of staging room is held back.
+//
+// It is a fixed, short delay rather than a backoff because nothing has failed:
+// the transfer is waiting for a condition somebody else will satisfy. Without
+// it the item is re-taken on the very next scheduler pass and spends the whole
+// outage rediscovering that the disk is still full.
+const resourceWait = 30 * time.Second
+
+// permanentTransferError reports whether trying again could possibly help.
+//
+// Retrying is the default, because almost everything that interrupts a transfer
+// here is a network or service blip. The exception is a source that is no longer
+// the file this item describes — a different size, a different revision, a path
+// that is not a file. Those cannot be fixed by waiting, and retrying one for an
+// hour only delays telling the operator what actually happened.
+func permanentTransferError(err error) bool {
+	return errors.Is(err, aliyunpan.ErrSourceChanged) ||
+		errors.Is(err, aliyunpan.ErrPathNotFound)
+}
+
 func (e *Engine) deferUntilLogin(ctx context.Context, item *Item) {
-	e.requeue(ctx, item, "等待重新登录阿里云盘")
+	e.requeue(ctx, item, "等待重新登录阿里云盘", nowMillis()+resourceWait.Milliseconds(), false)
 }
 
-func (e *Engine) deferUntilRetry(ctx context.Context, item *Item, err error) {
-	e.requeue(ctx, item, err.Error())
+// deferUntilResource holds a transfer that never started back for a moment. It
+// does not spend a retry attempt: a full staging disk or an expired token is
+// not this file's failure, and charging it for other files' downloads would
+// eventually fail a transfer that had never once been tried.
+func (e *Engine) deferUntilResource(ctx context.Context, item *Item, err error) {
+	e.requeue(ctx, item, err.Error(), nowMillis()+resourceWait.Milliseconds(), false)
 }
 
-// requeue puts a transfer back in the queue to be attempted again.
+// deferUntilRestart puts a transfer back exactly as it was found.
+//
+// The plugin is being shut down, so every running transfer is interrupted at
+// once. That is not a failure of any of them: charging each one an attempt
+// would mean a handful of restarts could exhaust a file's whole budget without
+// anything ever having gone wrong. It is also not worth a backoff — the process
+// is going away, and the work should resume as soon as it comes back.
+func (e *Engine) deferUntilRestart(ctx context.Context, item *Item) {
+	e.requeue(ctx, item, "插件重启，等待继续", 0, false)
+}
+
+// shuttingDown reports whether the plugin itself is going away, as opposed to
+// this one transfer having broken.
+func (e *Engine) shuttingDown() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.stopping
+}
+
+// retryLater schedules another attempt, or gives up when the budget is spent.
+// It reports whether the scheduler should be woken, matching transfer's own
+// return value: a transfer that has been parked until a deadline has nothing
+// for the scheduler to pick up yet.
+func (e *Engine) retryLater(ctx context.Context, item *Item, err error) bool {
+	if e.shuttingDown() || (ctx != nil && ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+		e.deferUntilRestart(ctx, item)
+		return false
+	}
+	policy := e.Settings().Retry
+	e.mu.Lock()
+	attempts := item.Attempts
+	e.mu.Unlock()
+
+	if !policy.Allows(attempts) {
+		e.logf("同步 %s 重试 %d 次后仍然失败", item.RemotePath, attempts)
+		e.fail(ctx, item, fmt.Errorf("重试 %d 次后仍然失败: %w", attempts, err))
+		return true
+	}
+	wait := jitter(policy.Backoff(attempts))
+	e.logf("同步 %s 失败（第 %d/%d 次），%s 后重试: %v",
+		item.RemotePath, attempts, policy.MaxAttempts, wait.Round(time.Second), err)
+	reason := fmt.Sprintf("第 %d/%d 次尝试失败，将在 %s 后重试: %s",
+		attempts, policy.MaxAttempts, wait.Round(time.Second), err.Error())
+	e.requeue(ctx, item, reason, time.Now().Add(wait).UnixMilli(), true)
+	return false
+}
+
+// jitter spreads a backoff by up to a fifth in either direction.
+//
+// One outage stops every transfer at the same instant. Without this they all
+// come back at the same instant too, which reproduces the thundering herd
+// against a service that has only just recovered.
+func jitter(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return 0
+	}
+	spread := int64(wait) / 5
+	if spread <= 0 {
+		return wait
+	}
+	offset, err := rand.Int(rand.Reader, big.NewInt(2*spread))
+	if err != nil {
+		return wait
+	}
+	return time.Duration(int64(wait) - spread + offset.Int64())
+}
+
+// requeue puts a transfer back in the queue to be attempted again, no earlier
+// than notBefore.
+//
+// chargeAttempt says whether this counts against the retry budget. takeNext
+// charges the attempt when it claims the item, so a requeue for something that
+// is not the transfer's own fault — no login, no staging room, a plugin
+// restart — has to give it back.
 //
 // Downloaded is deliberately left alone. The staged chunks it counts are still
 // on disk and the next attempt resumes from them, so zeroing it would report a
@@ -179,14 +294,22 @@ func (e *Engine) deferUntilRetry(ctx context.Context, item *Item, err error) {
 // made an interrupted transfer look like it had restarted from nothing. Uploaded
 // does go back to zero: the segments are re-sent from the beginning, and the old
 // upload job is abandoned rather than resumed.
-func (e *Engine) requeue(ctx context.Context, item *Item, reason string) {
+func (e *Engine) requeue(ctx context.Context, item *Item, reason string, notBefore int64, chargeAttempt bool) {
 	e.mu.Lock()
+	if e.cancelling[item.ID] || item.State == StateCancelled {
+		e.mu.Unlock()
+		return
+	}
 	item.State = StatePending
 	item.Stage = StageIdle
 	item.Uploaded = 0
 	item.UploadJobID = ""
 	item.Error = reason
 	item.FinishedAt = 0
+	item.NextAttemptAt = notBefore
+	if !chargeAttempt && item.Attempts > 0 {
+		item.Attempts--
+	}
 	item.resetSpeed()
 	e.markQueueDirtyLocked()
 	e.mu.Unlock()
@@ -358,7 +481,7 @@ func (e *Engine) upload(ctx context.Context, item *Item, staged string, limits h
 			e.abort(ctx, item, job.ID, err.Error(), abortState())
 			return err
 		}
-		e.logger.Printf("%s 缺少分片 %v，重发第 %d 轮", item.Name, missing, round+1)
+		e.logf("%s 缺少分片 %v，重发第 %d 轮", item.Name, missing, round+1)
 		pending = missing
 	}
 	e.abort(ctx, item, job.ID, "重发分片后仍未完成", abortState())
@@ -501,7 +624,7 @@ func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason, state str
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
 	if err := e.host.AbortUpload(cleanupCtx, jobID, reason, state); err != nil {
-		e.logger.Printf("放弃上传 %s 失败: %v", item.Name, err)
+		e.logf("放弃上传 %s 失败: %v", item.Name, err)
 	}
 	e.mu.Lock()
 	item.UploadJobID = ""

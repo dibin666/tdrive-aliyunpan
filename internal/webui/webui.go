@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
@@ -176,6 +177,35 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		s.engine.ClearFinished(ctx)
 		return okJSON(map[string]bool{"ok": true})
 
+	case "/api/downloads":
+		if request.Method != http.MethodGet {
+			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
+		}
+		// It walks the staging tree, so the page asks for it only while the
+		// 下载文件 tab is open rather than on the queue's own poll interval.
+		return okJSON(s.engine.Downloads(ctx))
+
+	case "/api/downloads/delete":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
+		ids, err := queueIDs(request.Body, query.Get("id"))
+		if err != nil {
+			return status(http.StatusBadRequest, err.Error()), nil
+		}
+		deleted, err := s.engine.DeleteStaged(ctx, ids...)
+		if err != nil {
+			return status(http.StatusBadRequest, err.Error()), nil
+		}
+		return okJSON(map[string]any{"ok": true, "count": deleted})
+
+	case "/api/downloads/prune":
+		if request.Method != http.MethodPost {
+			return status(http.StatusMethodNotAllowed, "只支持 POST"), nil
+		}
+		removed, freed := s.engine.PruneStaged()
+		return okJSON(map[string]any{"ok": true, "count": removed, "bytes": freed})
+
 	case "/api/browse":
 		if request.Method != http.MethodGet {
 			return status(http.StatusMethodNotAllowed, "只支持 GET"), nil
@@ -285,6 +315,8 @@ func (s *Server) requireAdmin(ctx context.Context, userID string) error {
 	return fmt.Errorf("找不到当前账号")
 }
 
+var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // maxQueueIDs bounds one batch. The queue view can select a whole screenful at
 // a time, but a request naming tens of thousands of ids is a mistake rather
 // than an intention.
@@ -307,6 +339,9 @@ func queueIDs(body []byte, single string) ([]string, error) {
 			if id == "" || seen[id] {
 				continue
 			}
+			if !safeIDPattern.MatchString(id) {
+				return nil, fmt.Errorf("队列项 ID 不合法: %q", id)
+			}
 			seen[id] = true
 			ids = append(ids, id)
 		}
@@ -321,6 +356,9 @@ func queueIDs(body []byte, single string) ([]string, error) {
 	single = strings.TrimSpace(single)
 	if single == "" {
 		return nil, fmt.Errorf("没有选中任何队列项")
+	}
+	if !safeIDPattern.MatchString(single) {
+		return nil, fmt.Errorf("队列项 ID 不合法: %q", single)
 	}
 	return []string{single}, nil
 }

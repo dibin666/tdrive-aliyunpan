@@ -63,6 +63,11 @@ type Item struct {
 	Uploaded   int64  `json:"uploaded"`
 	Error      string `json:"error,omitempty"`
 	Attempts   int    `json:"attempts"`
+	// NextAttemptAt holds a failed transfer back until its backoff has elapsed.
+	// It is a time rather than a countdown so it survives a restart: a plugin
+	// that was down for an hour should not make every waiting item start its
+	// wait again.
+	NextAttemptAt int64 `json:"nextAttemptAt,omitempty"`
 
 	Overwrite   bool `json:"overwrite,omitempty"`
 	DeleteAfter bool `json:"deleteAfter,omitempty"`
@@ -95,6 +100,13 @@ func (i *Item) TargetPath() string {
 // Active reports whether the item still occupies the engine.
 func (i *Item) Active() bool {
 	return i.State == StatePending || i.State == StateRunning
+}
+
+// WaitingToRetry reports whether the item is pending only because its backoff
+// has not elapsed yet. The page uses it to say "waiting to retry" rather than
+// "queued", which are very different answers to "why is this not moving".
+func (i *Item) WaitingToRetry(nowMillis int64) bool {
+	return i.State == StatePending && i.NextAttemptAt > nowMillis
 }
 
 // Finished reports whether the item has reached a terminal state.

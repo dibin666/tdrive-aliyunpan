@@ -1,6 +1,7 @@
 package aliyunpan
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -103,6 +104,7 @@ func TestSourceDownloadRefreshesExpiredDownloadURL(t *testing.T) {
 				response.WriteHeader(http.StatusForbidden)
 				return
 			}
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(content)-1, len(content)))
 			response.WriteHeader(http.StatusPartialContent)
 			_, _ = response.Write(content)
 		default:
@@ -307,6 +309,134 @@ func TestSourceDownloadResumesFromCheckpoint(t *testing.T) {
 	}
 	if _, err := os.Stat(staged + downloadPartSuffix + downloadProgressSuffix); !os.IsNotExist(err) {
 		t.Fatalf("checkpoint outlived a finished download: %v", err)
+	}
+}
+
+// Resuming at a chunk boundary throws away up to a whole chunk on every
+// connection, which for the real 32 MiB geometry is around 96 MiB per
+// interruption. This drives a download whose connection dies part-way through a
+// chunk and asserts that the next attempt asks for the bytes it is actually
+// missing rather than the whole chunk again.
+func TestSourceDownloadResumesPartwayThroughAChunk(t *testing.T) {
+	// The chunk has to be larger than one read buffer, because a chunk is
+	// written to disk a buffer at a time and a resume point can only ever be at
+	// a boundary the file has actually reached.
+	const chunkSize = 2 * downloadBufferSize
+	const servedBeforeBreak = downloadBufferSize
+	content := make([]byte, 2*chunkSize)
+	for index := range content {
+		content[index] = byte(index)
+	}
+
+	// The flusher is what makes an offset resumable, so the test must not
+	// outrun it. Two seconds of real time proves nothing extra.
+	previousInterval := partialFlushInterval
+	partialFlushInterval = 5 * time.Millisecond
+	defer func() { partialFlushInterval = previousInterval }()
+
+	var served struct {
+		sync.Mutex
+		begins []int64
+	}
+	breakSecondChunk := true
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/adrive/v1.0/openFile/get_by_path":
+			writeJSONResponse(response, map[string]any{"drive_id": "drive-1", "file_id": "file-1", "name": "file.bin", "type": "file", "size": len(content)})
+		case "/adrive/v1.0/openFile/getDownloadUrl":
+			writeJSONResponse(response, map[string]string{"url": "http://" + request.Host + "/content"})
+		case "/content":
+			var begin, end int64
+			if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &begin, &end); err != nil {
+				response.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			served.Lock()
+			served.begins = append(served.begins, begin)
+			served.Unlock()
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", begin, end, len(content)))
+			response.WriteHeader(http.StatusPartialContent)
+			if breakSecondChunk && begin == chunkSize {
+				// Hand over exactly one buffer, wait for it to be flushed into
+				// the checkpoint, then drop the connection mid-chunk.
+				_, _ = response.Write(content[begin : begin+servedBeforeBreak])
+				http.NewResponseController(response).Flush()
+				time.Sleep(20 * partialFlushInterval)
+				panic(http.ErrAbortHandler)
+			}
+			_, _ = response.Write(content[begin : end+1])
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client := New(t.TempDir(), "")
+	client.httpClient = server.Client()
+	client.openAPIURL = server.URL
+	client.setCredentials(accountCredentials{OpenAPIAccess: "access"})
+	stageDir := t.TempDir()
+	// One connection and one attempt, so the run stops at the broken chunk
+	// instead of quietly repairing it and hiding what is being tested.
+	requestTemplate := DownloadRequest{
+		CloudPath:     "/file.bin",
+		StageDir:      stageDir,
+		DriveID:       "drive-1",
+		SliceParallel: 1,
+		Retry:         1,
+		ChunkSize:     chunkSize,
+	}
+
+	if _, err := client.Download(context.Background(), requestTemplate, int64(len(content)), nil); err == nil {
+		t.Fatal("first download should have failed when the connection broke")
+	}
+
+	// The first chunk is complete and the second is one buffer in. Both have to
+	// be on disk, or the resume below proves nothing.
+	wantResumed := int64(chunkSize + servedBeforeBreak)
+	if got := StagedDownloadBytes(stageDir, "/file.bin", int64(len(content))); got != wantResumed {
+		t.Fatalf("bytes on disk after the break = %d, want %d", got, wantResumed)
+	}
+
+	served.Lock()
+	served.begins = nil
+	served.Unlock()
+	breakSecondChunk = false
+
+	var resumedBaseline int64 = -1
+	staged, err := client.Download(context.Background(), requestTemplate, int64(len(content)), func(done int64) {
+		if resumedBaseline < 0 {
+			resumedBaseline = done
+		}
+	})
+	if err != nil {
+		t.Fatalf("resumed download: %v", err)
+	}
+	if resumedBaseline != wantResumed {
+		t.Fatalf("first reported progress = %d, want the %d bytes already on disk", resumedBaseline, wantResumed)
+	}
+
+	served.Lock()
+	secondRun := append([]int64(nil), served.begins...)
+	served.Unlock()
+	for _, begin := range secondRun {
+		if begin == 0 {
+			t.Fatalf("resumed download re-fetched the finished first chunk: %v", secondRun)
+		}
+		if begin == chunkSize {
+			t.Fatalf("resumed download restarted the broken chunk from its start: %v", secondRun)
+		}
+	}
+	if len(secondRun) == 0 || secondRun[0] != chunkSize+servedBeforeBreak {
+		t.Fatalf("resumed download served %v, want it to start at byte %d", secondRun, chunkSize+servedBeforeBreak)
+	}
+
+	got, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatalf("ReadFile staged: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatal("resumed content does not match the source file")
 	}
 }
 

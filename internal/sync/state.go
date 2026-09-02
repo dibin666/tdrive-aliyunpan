@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/aliyunpan"
@@ -50,6 +51,11 @@ type Row struct {
 	Downloaded int64  `json:"downloaded"`
 	Error      string `json:"error,omitempty"`
 	Attempts   int    `json:"attempts"`
+	// NextAttemptAt and MaxAttempts let the page say "attempt 2 of 5, retrying
+	// in three minutes" rather than showing a queued row with an error on it
+	// and no explanation of what happens next.
+	NextAttemptAt int64 `json:"nextAttemptAt,omitempty"`
+	MaxAttempts   int   `json:"maxAttempts,omitempty"`
 	// Speed is bytes per second, and SpeedAt is when it was measured. The page
 	// applies its own freshness window to decide whether to show it, the same
 	// way the core page treats its live snapshots.
@@ -62,8 +68,12 @@ type Row struct {
 
 // Summary feeds the bar above the list.
 type Summary struct {
-	Active        int     `json:"active"`
-	Pending       int     `json:"pending"`
+	Active  int `json:"active"`
+	Pending int `json:"pending"`
+	// Retrying is the subset of Pending that is only waiting for a backoff to
+	// elapse. It is counted separately so "queued" does not silently include
+	// files that are actually stuck in a retry loop.
+	Retrying      int     `json:"retrying"`
 	Failed        int     `json:"failed"`
 	UploadSpeed   float64 `json:"uploadSpeed"`
 	DownloadSpeed float64 `json:"downloadSpeed"`
@@ -168,8 +178,9 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 	summary := Summary{}
 	oversize := false
 	todayStart := current.Quota.PeriodStart(now).UnixMilli()
+	nowMilli := now.UnixMilli()
 	for _, item := range e.queue {
-		rows = append(rows, item.row())
+		rows = append(rows, item.row(current.Retry.MaxAttempts))
 		switch item.State {
 		case StateRunning:
 			summary.Active++
@@ -182,6 +193,9 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 			}
 		case StatePending:
 			summary.Pending++
+			if item.WaitingToRetry(nowMilli) {
+				summary.Retrying++
+			}
 			if current.Quota.DailyBytes > 0 && item.Size > current.Quota.DailyBytes {
 				oversize = true
 			}
@@ -255,26 +269,28 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 	return snapshot
 }
 
-func (i *Item) row() Row {
+func (i *Item) row(maxAttempts int) Row {
 	row := Row{
-		ID:         i.ID,
-		JobID:      i.JobID,
-		JobName:    i.JobName,
-		DriveName:  i.DriveName,
-		Name:       i.Name,
-		RemotePath: i.RemotePath,
-		TargetPath: i.TargetPath(),
-		State:      i.State,
-		Stage:      i.Stage,
-		Total:      i.Size,
-		Done:       i.Uploaded,
-		Downloaded: i.Downloaded,
-		Error:      i.Error,
-		Attempts:   i.Attempts,
-		Speed:      i.speed,
-		CreatedAt:  i.CreatedAt,
-		StartedAt:  i.StartedAt,
-		FinishedAt: i.FinishedAt,
+		ID:            i.ID,
+		JobID:         i.JobID,
+		JobName:       i.JobName,
+		DriveName:     i.DriveName,
+		Name:          i.Name,
+		RemotePath:    i.RemotePath,
+		TargetPath:    i.TargetPath(),
+		State:         i.State,
+		Stage:         i.Stage,
+		Total:         i.Size,
+		Done:          i.Uploaded,
+		Downloaded:    i.Downloaded,
+		Error:         i.Error,
+		Attempts:      i.Attempts,
+		NextAttemptAt: i.NextAttemptAt,
+		MaxAttempts:   maxAttempts,
+		Speed:         i.speed,
+		CreatedAt:     i.CreatedAt,
+		StartedAt:     i.StartedAt,
+		FinishedAt:    i.FinishedAt,
 	}
 	if !i.speedAt.IsZero() {
 		row.SpeedAt = i.speedAt.UnixMilli()
@@ -313,6 +329,10 @@ func describeStatus(snapshot Snapshot, current settings.Settings, now time.Time)
 		return "不在同步窗口内"
 	case snapshot.Summary.Pending > 0 && snapshot.Quota.DailyBytes > 0 && snapshot.Quota.Remaining == 0:
 		return "今日配额已用尽，" + time.UnixMilli(snapshot.Quota.ResetAt).Format("01-02 15:04") + " 后继续"
+	case snapshot.Summary.Pending > 0 && snapshot.Summary.Pending == snapshot.Summary.Retrying:
+		// Everything left is waiting out a backoff, so "排队中" would suggest the
+		// queue is about to move when it is really nursing failures.
+		return fmt.Sprintf("%d 个文件失败后等待重试", snapshot.Summary.Retrying)
 	case snapshot.Summary.Pending > 0:
 		return "排队中"
 	case snapshot.Scan.Scanning:

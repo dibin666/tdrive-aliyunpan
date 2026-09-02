@@ -29,6 +29,19 @@ const (
 	legacyDownloadSuffix   = ".aliyunpan-downloading"
 )
 
+// partialFlushInterval is how often the bytes read so far are made durable and
+// written into the checkpoint. It bounds what an unexpected death costs to
+// roughly this much of each connection's throughput, and it is long enough that
+// the fsync it implies is not on the per-read path. It is a variable so the
+// resume tests do not have to spend two seconds proving the flush happened.
+var partialFlushInterval = 2 * time.Second
+
+// ErrSourceChanged reports that the cloud file is not the one the transfer was
+// queued for. Retrying cannot help — the bytes that would come back describe a
+// different file — so the queue records it as a failure rather than backing off
+// and trying again.
+var ErrSourceChanged = errors.New("云端文件已经变化")
+
 // DownloadRequest describes one source file to stage.
 type DownloadRequest struct {
 	CloudPath string
@@ -57,13 +70,15 @@ func StagedPath(stageDir, cloudPath string) string {
 // Download stages one cloud file, resuming whatever a previous attempt left
 // behind.
 //
-// The file is cut into fixed-size chunks fetched by a small pool of workers,
-// and every completed chunk is recorded in a sidecar next to the .part file.
-// Nothing here deletes a partial download on the way out: a transfer that was
-// cancelled, timed out, or died with the process is expected to be retried, and
-// the whole point of the sidecar is that the retry only fetches what is
-// missing. Discarding partial work is left to the caller, which is the only
-// layer that knows whether the queue item is being retried or abandoned.
+// The file is cut into fixed-size chunks fetched by a small pool of workers.
+// Every completed chunk is recorded in a sidecar next to the .part file, and so
+// is how far each chunk still in flight has got, so an interruption costs the
+// couple of seconds since the last flush rather than every chunk that had been
+// started. Nothing here deletes a partial download on the way out: a transfer
+// that was cancelled, timed out, or died with the process is expected to be
+// retried, and the whole point of the sidecar is that the retry only fetches
+// what is missing. Discarding partial work is left to the caller, which is the
+// only layer that knows whether the queue item is being retried or abandoned.
 func (c *CLI) Download(
 	ctx context.Context,
 	request DownloadRequest,
@@ -120,6 +135,9 @@ func (c *CLI) Download(
 			// persisted ID, but let the old path recover the transfer when that
 			// ID has become invalid.
 			file, err = c.fileByPath(downloadContext, request.DriveID, request.CloudPath)
+			if err == nil && file != nil && file.FileId != "" && file.FileId != request.FileID {
+				return "", fmt.Errorf("%w: 云端文件实体已变化 (期望 %s，收到 %s)", ErrSourceChanged, request.FileID, file.FileId)
+			}
 		}
 	} else {
 		file, err = c.fileByPath(downloadContext, request.DriveID, request.CloudPath)
@@ -128,11 +146,11 @@ func (c *CLI) Download(
 		return "", err
 	}
 	if file == nil || file.IsFolder() {
-		return "", fmt.Errorf("云盘路径不是文件: %s", request.CloudPath)
+		return "", fmt.Errorf("%w: 云盘路径不是文件: %s", ErrSourceChanged, request.CloudPath)
 	}
 	fileSize := file.FileSize
 	if expectedSize >= 0 && fileSize != expectedSize {
-		return "", fmt.Errorf("云端文件大小是 %d，队列记录是 %d", fileSize, expectedSize)
+		return "", fmt.Errorf("%w: 云端文件大小是 %d，队列记录是 %d", ErrSourceChanged, fileSize, expectedSize)
 	}
 
 	staged := StagedPath(request.StageDir, request.CloudPath)
@@ -206,12 +224,12 @@ func (c *CLI) Download(
 		return "", fmt.Errorf("预分配下载文件: %w", err)
 	}
 
-	_, resumedBytes := checkpoint.completed()
+	_, doneBytes, partialBytes := checkpoint.completed()
 	if progress != nil {
 		// Report the resumed baseline before fetching anything, so a queue item
 		// that was requeued shows what is really on disk instead of starting its
 		// bar at zero and appearing to download the file a second time.
-		progress(resumedBytes)
+		progress(doneBytes + partialBytes)
 	}
 	// Same rule as markDone: bookkeeping that cannot be written costs the
 	// ability to resume, not the download.
@@ -219,12 +237,11 @@ func (c *CLI) Download(
 
 	if fileSize > 0 {
 		if pending := checkpoint.pending(); len(pending) > 0 {
-			downloadURL, err := c.getDownloadURL(downloadContext, request.DriveID, file.FileId)
-			if err != nil {
-				return "", err
-			}
-			urlState := &downloadURLState{url: downloadURL}
-			if err := c.downloadChunks(downloadContext, partFile, request, file.FileId, checkpoint, pending, resumedBytes, urlState, progress); err != nil {
+			urlState := &downloadURLState{}
+			if err := c.downloadChunks(
+				downloadContext, partFile, request, file.FileId,
+				checkpoint, pending, doneBytes, urlState, progress,
+			); err != nil {
 				return "", err
 			}
 		}
@@ -257,6 +274,31 @@ func DiscardPartialDownload(stageDir, cloudPath string) {
 	_ = os.Remove(partial)
 }
 
+// StagedFilePath names the file one cloud path currently occupies on disk.
+//
+// A download that has not finished is writing to the .part file rather than to
+// the name it will end up under, and the 下载文件 page has to show the path that
+// is really there. Which suffix that is stays a detail of this package.
+func StagedFilePath(stageDir, cloudPath string) string {
+	cleanPath, err := cleanDownloadPath(cloudPath)
+	if err != nil {
+		return ""
+	}
+	staged := StagedPath(stageDir, cleanPath)
+	if isRegularFile(staged) {
+		return staged
+	}
+	if partial := staged + downloadPartSuffix; isRegularFile(partial) {
+		return partial
+	}
+	return staged
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 // StagedDownloadBytes reports how much of one cloud file is already on local
 // disk, counting a finished staged copy as complete and a partial one by its
 // checkpoint. It lets the queue show real progress for an item that has not
@@ -277,15 +319,42 @@ func StagedDownloadBytes(stageDir, cloudPath string, size int64) int64 {
 	return checkpointBytesForSize(partial, size)
 }
 
+// downloadURLState hands out the signed link the chunk workers share.
 type downloadURLState struct {
 	mu  sync.Mutex
 	url string
 }
 
-func (s *downloadURLState) current() string {
+// current returns a link that is not about to expire, fetching a new one when
+// the link in hand is missing or spent.
+//
+// The lock is held across the refresh on purpose. Three chunks that notice the
+// same expiry at the same moment would otherwise ask the drive for three links;
+// serialising them means the two that arrive second find a fresh link already
+// waiting.
+func (s *downloadURLState) current(ctx context.Context, cli *CLI, driveID, fileID string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.url
+	if s.url != "" && !downloadURLExhausted(s.url, time.Now()) {
+		return s.url, nil
+	}
+	refreshed, err := cli.getDownloadURL(ctx, driveID, fileID)
+	if err != nil {
+		return "", err
+	}
+	s.url = refreshed
+	return refreshed, nil
+}
+
+// invalidate drops a link the drive has rejected, so the next caller fetches a
+// replacement. Naming the stale link keeps a worker that is a whole round trip
+// behind from throwing away the link another worker has just fetched.
+func (s *downloadURLState) invalidate(stale string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.url == stale {
+		s.url = ""
+	}
 }
 
 func (c *CLI) getDownloadURL(ctx context.Context, driveID, fileID string) (string, error) {
@@ -303,44 +372,45 @@ func (c *CLI) getDownloadURL(ctx context.Context, driveID, fileID string) (strin
 	return result.Url, nil
 }
 
-// downloadProgress turns per-read deltas from several concurrent chunks into
-// one absolute number for the caller.
+// downloadProgress turns per-chunk progress from several concurrent workers
+// into one absolute number for the caller.
 //
-// It reports absolute rather than incremental progress because a chunk that
-// has to be retried un-does its own partial contribution: the bytes it read
-// before the connection broke are not on disk in any usable sense, and a
-// counter that only ever went up would claim they were. The queue is told the
-// truth and shows the bar dip by one chunk instead of silently over-reporting.
+// It reports absolute rather than incremental progress because a chunk that has
+// to be retried gives back the bytes it read but never made durable: those
+// bytes are not resumable in any usable sense, and a counter that only ever
+// went up would claim they were. The queue is told the truth and shows the bar
+// dip by a couple of seconds' worth instead of silently over-reporting.
 type downloadProgress struct {
-	mu      sync.Mutex
-	base    int64
-	partial map[int]int64
-	total   int64
-	report  func(int64)
+	mu sync.Mutex
+	// base is the bytes held by chunks the bitmap has already accepted.
+	base int64
+	// chunks is how much of each in-flight chunk is accounted for.
+	chunks map[int]int64
+	total  int64
+	report func(int64)
 }
 
-func newDownloadProgress(base, total int64, report func(int64)) *downloadProgress {
-	return &downloadProgress{base: base, partial: map[int]int64{}, total: total, report: report}
-}
-
-func (p *downloadProgress) advance(index int, delta int64) {
-	if p == nil || delta <= 0 {
-		return
+func newDownloadProgress(base, total int64, chunks map[int]int64, report func(int64)) *downloadProgress {
+	seeded := make(map[int]int64, len(chunks))
+	for index, offset := range chunks {
+		seeded[index] = offset
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.partial[index] += delta
-	p.emitLocked()
+	return &downloadProgress{base: base, chunks: seeded, total: total, report: report}
 }
 
-// restart drops a chunk's in-flight bytes because its attempt failed.
-func (p *downloadProgress) restart(index int) {
+// setChunk records how far one chunk has reached, counted from its own start.
+// It is absolute rather than incremental so that a retry can move it backwards
+// to the last durable offset with the same call it uses to move it forwards.
+func (p *downloadProgress) setChunk(index int, offset int64) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.partial, index)
+	if p.chunks[index] == offset {
+		return
+	}
+	p.chunks[index] = offset
 	p.emitLocked()
 }
 
@@ -351,14 +421,14 @@ func (p *downloadProgress) complete(index int, size int64) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.partial, index)
+	delete(p.chunks, index)
 	p.base += size
 	p.emitLocked()
 }
 
 func (p *downloadProgress) currentLocked() int64 {
 	value := p.base
-	for _, bytes := range p.partial {
+	for _, bytes := range p.chunks {
 		value += bytes
 	}
 	if value > p.total {
@@ -384,6 +454,102 @@ func (p *downloadProgress) emitLocked() {
 	p.report(p.currentLocked())
 }
 
+// partialFlusher makes the in-flight chunks' progress durable.
+//
+// The order it enforces is the whole point: the file's data is flushed to the
+// device first, and only then is the offset that describes it written into the
+// checkpoint. Recording an offset whose bytes are still in the page cache is
+// what lets a power loss leave a sidecar claiming bytes the file does not have,
+// which produces a silently corrupt resume rather than a slow one.
+type partialFlusher struct {
+	mu      sync.Mutex
+	offsets map[int]int64
+	changed bool
+
+	file       *os.File
+	checkpoint *checkpointFile
+}
+
+func newPartialFlusher(file *os.File, checkpoint *checkpointFile, seed map[int]int64) *partialFlusher {
+	offsets := make(map[int]int64, len(seed))
+	for index, offset := range seed {
+		offsets[index] = offset
+	}
+	return &partialFlusher{offsets: offsets, file: file, checkpoint: checkpoint}
+}
+
+// note records a chunk's latest offset. It does not touch the disk; the ticker
+// does, so that a 256 KiB read does not cost an fsync.
+func (f *partialFlusher) note(index int, offset int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.offsets[index] == offset {
+		return
+	}
+	f.offsets[index] = offset
+	f.changed = true
+}
+
+// forget drops a chunk the bitmap has taken ownership of.
+func (f *partialFlusher) forget(index int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, held := f.offsets[index]; !held {
+		return
+	}
+	delete(f.offsets, index)
+	f.changed = true
+}
+
+// flush syncs the data and then records where it reached. A failure is
+// swallowed for the same reason markDone's is: it costs the ability to resume,
+// not the download that is currently working.
+func (f *partialFlusher) flush() {
+	f.mu.Lock()
+	if !f.changed {
+		f.mu.Unlock()
+		return
+	}
+	snapshot := make(map[int]int64, len(f.offsets))
+	for index, offset := range f.offsets {
+		snapshot[index] = offset
+	}
+	f.changed = false
+	f.mu.Unlock()
+
+	if err := f.file.Sync(); err != nil {
+		// The offsets are not durable, so they must not be written. Marking the
+		// snapshot dirty again lets the next tick try the whole sequence.
+		f.mu.Lock()
+		f.changed = true
+		f.mu.Unlock()
+		return
+	}
+	if err := f.checkpoint.setPartials(snapshot); err != nil {
+		// Writing the checkpoint failed (e.g. disk transiently full). Marking
+		// the flusher dirty again lets the next tick retry persisting the
+		// progress instead of permanently freezing at an old offset.
+		f.mu.Lock()
+		f.changed = true
+		f.mu.Unlock()
+	}
+}
+
+func (f *partialFlusher) run(ctx context.Context, done <-chan struct{}) {
+	ticker := time.NewTicker(partialFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			f.flush()
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		}
+	}
+}
+
 // downloadChunks fetches the listed chunks with a fixed pool of workers,
 // recording each one in the checkpoint as it lands.
 func (c *CLI) downloadChunks(
@@ -393,7 +559,7 @@ func (c *CLI) downloadChunks(
 	fileID string,
 	checkpoint *checkpointFile,
 	pending []int,
-	resumedBytes int64,
+	doneBytes int64,
 	urlState *downloadURLState,
 	progress func(done int64),
 ) error {
@@ -407,9 +573,37 @@ func (c *CLI) downloadChunks(
 		parallel = 1
 	}
 
+	// Every pending chunk may already hold bytes from an earlier attempt, and
+	// both the reported progress and the flusher have to start from them rather
+	// than from zero.
+	resumeOffsets := make(map[int]int64, len(pending))
+	for _, index := range pending {
+		if offset := checkpoint.partialBytes(index); offset > 0 {
+			resumeOffsets[index] = offset
+		}
+	}
+
 	downloadContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	tracker := newDownloadProgress(resumedBytes, fileSize, progress)
+	tracker := newDownloadProgress(doneBytes, fileSize, resumeOffsets, progress)
+	flusher := newPartialFlusher(file, checkpoint, resumeOffsets)
+	// The flusher is stopped before this function returns, so it can never
+	// write into a checkpoint whose .part file the caller has already renamed.
+	flusherDone := make(chan struct{})
+	var flusherStopped sync.WaitGroup
+	flusherStopped.Add(1)
+	go func() {
+		defer flusherStopped.Done()
+		flusher.run(downloadContext, flusherDone)
+	}()
+	defer func() {
+		close(flusherDone)
+		flusherStopped.Wait()
+		// One last flush on the way out, including the error and cancellation
+		// paths: this is exactly the moment whose offsets the next attempt
+		// resumes from.
+		flusher.flush()
+	}()
 
 	work := make(chan int)
 	go func() {
@@ -438,7 +632,7 @@ func (c *CLI) downloadChunks(
 				}
 				err := c.downloadChunkWithRetry(
 					downloadContext, file, request.DriveID, fileID,
-					index, begin, end, request.Retry, urlState, tracker,
+					index, begin, end, request.Retry, urlState, tracker, flusher, checkpoint,
 				)
 				if err != nil {
 					results <- err
@@ -446,6 +640,16 @@ func (c *CLI) downloadChunks(
 					return
 				}
 				tracker.complete(index, end-begin)
+				flusher.forget(index)
+				// The file's data must be durable before the bitmap claims it.
+				// Recording a completed chunk while its bytes are still in the
+				// OS cache is what lets a power loss leave the sidecar claiming
+				// a finished chunk whose .part file holds only zeros.
+				if err := file.Sync(); err != nil {
+					results <- fmt.Errorf("持久化下载分块 %d: %w", index, err)
+					cancel()
+					return
+				}
 				// A checkpoint that cannot be written costs the ability to
 				// resume, not the transfer: the bytes are already on disk and
 				// the remaining chunks are still fetched. Failing here would
@@ -467,10 +671,22 @@ func (c *CLI) downloadChunks(
 		}
 	}
 	if firstError != nil {
+		// A changed source outranks the cancellation it triggers in the other
+		// workers: it is the reason the transfer stopped, and it is the one
+		// error the queue must not retry.
+		if errors.Is(firstError, ErrSourceChanged) {
+			return firstError
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return firstError
+	}
+	if err := downloadContext.Err(); err != nil {
+		return err
+	}
+	if pendingLeft := checkpoint.pending(); len(pendingLeft) > 0 {
+		return errors.New("下载分片未全部完成")
 	}
 	return nil
 }
@@ -478,8 +694,12 @@ func (c *CLI) downloadChunks(
 var errDownloadURLExpired = errors.New("云端下载链接已失效")
 
 // downloadChunkWithRetry fetches one chunk, refreshing the signed URL when the
-// drive expires it. A failed attempt restarts only this chunk, which is the
-// whole reason the file is cut into chunks in the first place.
+// drive expires it.
+//
+// A failed attempt restarts this chunk alone, and only from the last offset the
+// flusher made durable rather than from the chunk's start — which is the
+// difference between an interruption costing a couple of seconds and costing up
+// to a whole chunk on every connection.
 func (c *CLI) downloadChunkWithRetry(
 	ctx context.Context,
 	file *os.File,
@@ -491,48 +711,71 @@ func (c *CLI) downloadChunkWithRetry(
 	retry int,
 	urlState *downloadURLState,
 	tracker *downloadProgress,
+	flusher *partialFlusher,
+	checkpoint *checkpointFile,
 ) error {
 	var lastError error
 	for attempt := 0; attempt < retry; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		currentURL := urlState.current()
-		err := c.downloadRange(ctx, file, currentURL, begin, end, func(delta int64) {
-			tracker.advance(index, delta)
+		// Whatever the previous attempt read but never flushed is not on disk in
+		// any resumable sense, so both the resume point and the reported total
+		// come back to the last durable offset.
+		offset := checkpoint.partialBytes(index)
+		tracker.setChunk(index, offset)
+		if offset >= end-begin {
+			return nil
+		}
+
+		currentURL, err := urlState.current(ctx, c, driveID, fileID)
+		if err != nil {
+			lastError = err
+			if waitErr := waitBeforeNextAttempt(ctx, attempt, retry); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
+
+		written := offset
+		err = c.downloadRange(ctx, file, currentURL, begin+offset, end, checkpoint.meta.Size, func(delta int64) {
+			written += delta
+			tracker.setChunk(index, written)
+			flusher.note(index, written)
 		})
 		if err == nil {
 			return nil
 		}
-		// Whatever this attempt read is not accounted for by the checkpoint, so
-		// it must not stay in the reported total either.
-		tracker.restart(index)
+		if errors.Is(err, ErrSourceChanged) {
+			// The bytes coming back belong to a different file. Another attempt
+			// would only fetch more of the wrong thing.
+			return err
+		}
 		lastError = err
 		if errors.Is(err, errDownloadURLExpired) {
-			urlState.mu.Lock()
-			if urlState.url == currentURL {
-				refreshedURL, refreshErr := c.getDownloadURL(ctx, driveID, fileID)
-				if refreshErr != nil {
-					urlState.mu.Unlock()
-					lastError = refreshErr
-				} else {
-					urlState.url = refreshedURL
-					urlState.mu.Unlock()
-				}
-			} else {
-				urlState.mu.Unlock()
-			}
+			urlState.invalidate(currentURL)
 		}
-		if attempt+1 < retry {
-			if waitErr := waitForRetry(ctx, attempt); waitErr != nil {
-				return waitErr
-			}
+		if waitErr := waitBeforeNextAttempt(ctx, attempt, retry); waitErr != nil {
+			return waitErr
 		}
 	}
 	return lastError
 }
 
-func (c *CLI) downloadRange(ctx context.Context, file *os.File, downloadURL string, begin, end int64, progress func(done int64)) error {
+func waitBeforeNextAttempt(ctx context.Context, attempt, retry int) error {
+	if attempt+1 >= retry {
+		return nil
+	}
+	return waitForRetry(ctx, attempt)
+}
+
+func (c *CLI) downloadRange(
+	ctx context.Context,
+	file *os.File,
+	downloadURL string,
+	begin, end, totalSize int64,
+	progress func(done int64),
+) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("创建分片下载请求: %w", err)
@@ -560,11 +803,14 @@ func (c *CLI) downloadRange(ctx context.Context, file *os.File, downloadURL stri
 		}
 		return fmt.Errorf("下载分片返回 HTTP %d", response.StatusCode)
 	}
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("下载分片返回意外的 HTTP 状态: %d", response.StatusCode)
+	}
 	if response.StatusCode == http.StatusOK && begin != 0 {
 		return errors.New("下载服务器忽略了 Range 请求")
 	}
 	if response.StatusCode == http.StatusPartialContent {
-		if err := validateContentRange(response.Header.Get("Content-Range"), begin, end); err != nil {
+		if err := validateContentRange(response.Header.Get("Content-Range"), begin, end, totalSize); err != nil {
 			return err
 		}
 	}
@@ -602,10 +848,18 @@ func (c *CLI) downloadRange(ctx context.Context, file *os.File, downloadURL stri
 	return nil
 }
 
-func validateContentRange(value string, expectedBegin, expectedEnd int64) error {
+// validateContentRange checks that the response describes the range that was
+// asked for, of the file that was asked for.
+//
+// The total is the important one. A range that comes back against a different
+// file size means the cloud copy was replaced while it was being fetched, and
+// continuing would stitch two revisions of a file together into something that
+// matches neither — so that is reported as a changed source rather than as
+// something to retry.
+func validateContentRange(value string, expectedBegin, expectedEnd, expectedTotal int64) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return nil
+		return errors.New("下载服务器返回 206 但缺少 Content-Range 响应头")
 	}
 	var begin, end int64
 	var total string
@@ -614,6 +868,13 @@ func validateContentRange(value string, expectedBegin, expectedEnd int64) error 
 	}
 	if begin != expectedBegin || end != expectedEnd-1 {
 		return fmt.Errorf("下载分片范围是 bytes %d-%d，期望 bytes %d-%d", begin, end, expectedBegin, expectedEnd-1)
+	}
+	reported, err := strconv.ParseInt(total, 10, 64)
+	if err != nil {
+		return fmt.Errorf("下载分片的 Content-Range 文件总大小不合法: %q", total)
+	}
+	if expectedTotal > 0 && reported != expectedTotal {
+		return fmt.Errorf("%w: 下载分片报告的文件大小是 %d，期望 %d", ErrSourceChanged, reported, expectedTotal)
 	}
 	return nil
 }

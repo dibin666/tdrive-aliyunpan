@@ -309,3 +309,81 @@ func TestQueueIDsReadsBothShapes(t *testing.T) {
 		t.Error("a malformed body was accepted")
 	}
 }
+
+// The 下载文件 page reads and deletes local files, so it sits behind the same
+// administrator gate as everything else under /api.
+func TestDownloadRoutesRequireAdministrator(t *testing.T) {
+	server := newServer(t)
+	for _, route := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/api/downloads", ""},
+		{http.MethodPost, "/api/downloads/delete", `{"ids":["item-1"]}`},
+		{http.MethodPost, "/api/downloads/prune", ""},
+	} {
+		response, err := server.Handle(context.Background(), request(route.method, route.path, "user-1", route.body))
+		if err != nil {
+			t.Fatalf("%s %s: %v", route.method, route.path, err)
+		}
+		if response.Status != http.StatusForbidden {
+			t.Errorf("%s %s: status = %d, want 403", route.method, route.path, response.Status)
+		}
+	}
+}
+
+func TestDownloadsIsServedAsAList(t *testing.T) {
+	server := newServer(t)
+	response, err := server.Handle(context.Background(), request(http.MethodGet, "/api/downloads", "admin-1", ""))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if response.Status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Status, response.Body)
+	}
+	var view syncengine.DownloadsView
+	if err := json.Unmarshal(response.Body, &view); err != nil {
+		t.Fatalf("decode downloads: %v", err)
+	}
+	// An empty staging area still has to render as a list rather than as null,
+	// because the page maps over it without a guard.
+	if view.Files == nil {
+		t.Error("files should be an empty array so the page can render a list")
+	}
+	if view.StageDir == "" {
+		t.Error("the page shows the staging directory it is describing")
+	}
+}
+
+func TestDownloadRoutesRejectTheWrongMethod(t *testing.T) {
+	server := newServer(t)
+	for _, route := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/downloads"},
+		{http.MethodGet, "/api/downloads/delete"},
+		{http.MethodGet, "/api/downloads/prune"},
+	} {
+		response, err := server.Handle(context.Background(), request(route.method, route.path, "admin-1", ""))
+		if err != nil {
+			t.Fatalf("%s %s: %v", route.method, route.path, err)
+		}
+		if response.Status != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s: status = %d, want 405", route.method, route.path, response.Status)
+		}
+	}
+}
+
+// Deleting nothing is a mistake worth reporting rather than a no-op success.
+func TestDeleteStagedRejectsAnEmptySelection(t *testing.T) {
+	server := newServer(t)
+	response, err := server.Handle(context.Background(), request(http.MethodPost, "/api/downloads/delete", "admin-1", `{"ids":[]}`))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if response.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.Status)
+	}
+}

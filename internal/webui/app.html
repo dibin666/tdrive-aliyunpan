@@ -508,6 +508,7 @@
       const API = (location.pathname.replace(/\/+$/, '') || '/') + '/api'
       const TABS = [
         ['sync', '同步'],
+        ['downloads', '下载文件'],
         ['jobs', '任务'],
         ['plan', '计划与限额'],
         ['account', '账号'],
@@ -553,6 +554,11 @@
         // Ids of the queue rows that are ticked. Kept here rather than in the
         // DOM because the list repaints on every poll.
         selected: new Set(),
+        // The 下载文件 tab has its own snapshot and its own ticks. It walks the
+        // staging tree on the server, so it is fetched only while that tab is
+        // open rather than riding along on the queue's poll.
+        downloads: null,
+        stagedSelected: new Set(),
         density: localStorage.getItem('tdrive.transferDensity') || 'compact',
         loading: false,
         lastLoad: 0,
@@ -605,6 +611,14 @@
         if (total < 60) return total + ' 秒'
         if (total < 3600) return Math.floor(total / 60) + ' 分 ' + (total % 60) + ' 秒'
         return Math.floor(total / 3600) + ' 小时 ' + Math.floor((total % 3600) / 60) + ' 分'
+      }
+
+      // retryCountdown describes the wait left before an automatic retry. The
+      // deadline can already have passed, because the scheduler only looks
+      // every thirty seconds; "—后重试" is not a sentence, so that case gets its
+      // own wording.
+      function retryCountdown(remaining) {
+        return remaining > 0 ? duration(remaining) + '后重试' : '即将重试'
       }
 
       function liveSpeed(row, now) {
@@ -675,6 +689,15 @@
         state.loading = true
         try {
           state.snapshot = await call('/state')
+          // The staging walk is only paid for while the tab that shows it is
+          // open. A failure there must not take the whole page down with it.
+          if (state.tab === 'downloads') {
+            try {
+              state.downloads = await call('/downloads')
+            } catch (error) {
+              toast(error.message, 'error')
+            }
+          }
           state.lastLoad = Date.now()
           render()
         } catch (error) {
@@ -741,6 +764,8 @@
           }
         } else if (state.tab === 'sync') {
           page.innerHTML = syncView(snapshot)
+        } else if (state.tab === 'downloads') {
+          page.innerHTML = downloadsView(snapshot)
         } else if (state.tab === 'jobs') {
           page.innerHTML = jobsView(snapshot)
         } else {
@@ -767,7 +792,12 @@
           '<div class="card">',
           '<div class="stats">',
           stat('进行中', String(summary.active)),
-          stat('排队中', String(summary.pending)),
+          stat(
+            '排队中',
+            summary.retrying > 0
+              ? summary.pending + '（' + summary.retrying + ' 个等待重试）'
+              : String(summary.pending),
+          ),
           stat('上传速度', rate(summary.uploadSpeed)),
           stat('下载速度', rate(summary.downloadSpeed)),
           stat('今日完成', summary.todayCount + ' 个 · ' + bytes(summary.todayBytes)),
@@ -841,7 +871,7 @@
               '<div class="rows" data-density="' +
                 state.density +
                 '">' +
-                rows.map((row) => transferRow(row, now)).join('') +
+                rows.map((row) => transferRow(row, now, snapshot.now || now)).join('') +
                 '</div>',
           '</div>',
           '<div class="hint">暂存目录 ' +
@@ -892,7 +922,7 @@
 
         const selectedRows = rows.filter((row) => state.selected.has(row.id))
         const stoppable = selectedRows.filter((row) => !FINISHED_STATES.has(row.state)).length
-        const retryable = selectedRows.filter((row) => row.state !== 'running').length
+        const retryable = selectedRows.filter((row) => row.state !== 'running' && row.state !== 'complete').length
         const removable = selectedRows.filter((row) => FINISHED_STATES.has(row.state)).length
 
         return [
@@ -937,7 +967,10 @@
         )
       }
 
-      function transferRow(row, now) {
+      // serverNow is the snapshot's own clock. A retry countdown is measured
+      // against it rather than the browser's, because the deadline was written
+      // by the server and the two clocks do not have to agree.
+      function transferRow(row, now, serverNow) {
         // The bar tracks whichever half is running: disk on the way in,
         // Telegram on the way out. Mixing them into one number would make a
         // finished download look like a half-finished upload. A row that is
@@ -949,6 +982,7 @@
         const expanded = state.expanded.has(row.id)
         const elapsed = row.finishedAt && row.startedAt ? row.finishedAt - row.startedAt : 0
         const average = elapsed > 0 ? (row.total / elapsed) * 1000 : 0
+        const waiting = row.state === 'pending' && row.nextAttemptAt > serverNow
 
         return [
           '<div class="trow" data-row="' + esc(row.id) + '">',
@@ -967,11 +1001,24 @@
           row.state === 'running'
             ? esc((STAGE_LABEL[row.stage] || '进行中') + ' · ' + bytes(measured) + ' / ' + bytes(row.total)) +
               (speed > 0 ? ' · ' + esc(rate(speed)) : '')
-            : esc(STATUS_LABEL[row.state] + ' · ' + bytes(row.total)),
+            : waiting
+              ? // A pending row carrying an error is a retry in its backoff.
+                // Labelling it 排队中 made an automatic retry look like a queue
+                // that had simply stopped moving.
+                esc(
+                  '第 ' + row.attempts + '/' + row.maxAttempts + ' 次失败，' +
+                    retryCountdown(row.nextAttemptAt - serverNow) + ' · ' + bytes(row.total),
+                )
+              : esc(STATUS_LABEL[row.state] + ' · ' + bytes(row.total)),
           '</span>',
           row.state === 'failed' || row.state === 'cancelled'
             ? '<button class="btn btn-ghost" data-retry="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">重试</button>'
-            : '',
+            : waiting
+              ? // Skipping the backoff is the natural thing to want once the
+                // operator has fixed whatever broke, and it also hands the row
+                // a fresh attempt budget.
+                '<button class="btn btn-ghost" data-retry="' + esc(row.id) + '" style="padding:.25rem .5rem;font-size:.75rem">立即重试</button>'
+              : '',
           // Offered for a running transfer too, now that cancelling one
           // actually stops it rather than being refused.
           !FINISHED_STATES.has(row.state)
@@ -989,7 +1036,8 @@
               detail('开始', clock(row.startedAt)) +
               detail('用时', duration(elapsed)) +
               detail('平均速度', average > 0 ? rate(average) : '—') +
-              detail('尝试次数', String(row.attempts)) +
+              detail('尝试次数', row.maxAttempts > 0 ? row.attempts + ' / ' + row.maxAttempts : String(row.attempts)) +
+              (waiting ? detail('下次重试', clock(row.nextAttemptAt)) : '') +
               detail('创建', clock(row.createdAt)) +
               (row.error ? detail('错误', row.error) : '') +
               '</dl>'
@@ -1000,6 +1048,172 @@
 
       function detail(key, value) {
         return '<div><dt>' + esc(key) + '</dt><dd>' + esc(value) + '</dd></div>'
+      }
+
+      // -------------------------------------------------------- downloads tab
+
+      /**
+       * downloadsView lists what the plugin is holding on local disk.
+       *
+       * A failed upload no longer deletes the file it downloaded, which is what
+       * makes retrying one cheap — and what makes the staging area something
+       * that has to be looked at. This is the only place those bytes are
+       * visible, and the only place they can be removed without also throwing
+       * away the queue record that explains them.
+       */
+      function downloadsView(snapshot) {
+        const view = state.downloads
+        if (!view) return '<div class="card"><div class="empty">正在读取暂存目录…</div></div>'
+        const files = view.files || []
+        const chosen = files.filter((file) => state.stagedSelected.has(file.itemId))
+        const usedPercent =
+          view.limitBytes > 0 ? Math.min(100, (view.usedBytes / view.limitBytes) * 100) : 0
+        const stuck = files.filter((file) => file.complete && file.state !== 'complete').length
+
+        return [
+          '<div class="card">',
+          '<div class="stats">',
+          stat('本地文件', String(files.length)),
+          stat('占用空间', bytes(view.usedBytes)),
+          stat('暂存上限', view.limitBytes > 0 ? bytes(view.limitBytes) : '不限'),
+          stat('已下完待上传', String(stuck)),
+          stat('无主文件', view.orphanCount + ' 个 · ' + bytes(view.orphanBytes)),
+          '</div>',
+          view.limitBytes > 0
+            ? '<div style="margin-top:.75rem;height:6px;border-radius:999px;background:var(--sunk);overflow:hidden">' +
+              '<div style="height:100%;width:' +
+              usedPercent.toFixed(1) +
+              '%;background:' +
+              (usedPercent >= 90 ? 'var(--color-rust, #c0563b)' : 'var(--color-clay)') +
+              '"></div></div>'
+            : '',
+          '<div class="hint">暂存目录 ' + esc(view.stageDir) + '。</div>',
+          usedPercent >= 90
+            ? '<div class="warn-box" style="margin-top:.75rem">暂存目录快满了。新的下载会一直等到腾出空间为止，先删掉这里不需要的文件。</div>'
+            : '',
+          '</div>',
+
+          '<div class="toolbar">',
+          '<p class="section-title" style="margin:0">暂存文件</p>',
+          '<span class="grow"></span>',
+          view.orphanCount > 0
+            ? '<button class="btn btn-ghost" id="prune-staged" type="button">清理无主文件（' +
+              view.orphanCount +
+              '）</button>'
+            : '',
+          '</div>',
+
+          '<div class="card" style="padding:0">',
+          files.length === 0
+            ? '<div class="empty">暂存目录是空的。上传成功后本地文件会按设置删除，失败的会留在这里等你处理。</div>'
+            : stagedSelectionBar(files, chosen) +
+              '<div class="rows" data-density="' +
+                state.density +
+                '">' +
+                files.map((file) => stagedRow(file)).join('') +
+                '</div>',
+          '</div>',
+          '<div class="hint">「占用空间」是文件真正吃掉的磁盘：未下完的文件一开始就按最终大小占位，所以它通常大于「已下载」。删除只动本地文件，队列记录和 tdrive 里已经传好的内容都不受影响。</div>',
+        ].join('')
+      }
+
+      function stagedSelectionBar(files, chosen) {
+        const removable = chosen.filter((file) => !file.running)
+        const stateOf =
+          chosen.length === 0 ? 'false' : chosen.length === files.length ? 'true' : 'mixed'
+        return [
+          '<div class="select-bar">',
+          checkbox(stateOf, 'select-all-staged', chosen.length === files.length ? '取消全选' : '全选'),
+          chosen.length > 0
+            ? '<span>已选 ' + chosen.length + ' / ' + files.length + ' 项</span>'
+            : '<span style="color:var(--muted)">' + files.length + ' 项</span>',
+          '<span class="grow"></span>',
+          removable.length > 0
+            ? '<button class="btn btn-danger" id="bulk-delete-staged" type="button" style="padding:.25rem .5rem;font-size:.75rem">删除 ' +
+              removable.length +
+              ' 个本地文件</button>'
+            : '',
+          chosen.length > 0
+            ? '<button class="btn btn-ghost" id="clear-staged-selection" type="button" style="padding:.25rem .5rem;font-size:.75rem">取消选择</button>'
+            : '',
+          '</div>',
+        ].join('')
+      }
+
+      function stagedRow(file) {
+        const percent = file.size > 0 ? Math.min(100, (file.downloaded / file.size) * 100) : 0
+        const expanded = state.expanded.has('staged:' + file.itemId)
+        const label = file.orphan
+          ? '无主文件'
+          : file.complete && file.state !== 'complete'
+            ? '已下完，等待上传'
+            : STATUS_LABEL[file.state] || '未知'
+
+        return [
+          '<div class="trow" data-row="staged:' + esc(file.itemId) + '">',
+          percent > 0 ? '<div class="fill" style="width:' + percent.toFixed(1) + '%"></div>' : '',
+          '<div class="body">',
+          checkbox(
+            state.stagedSelected.has(file.itemId) ? 'true' : 'false',
+            '',
+            (state.stagedSelected.has(file.itemId) ? '取消选择 ' : '选择 ') + (file.name || file.itemId),
+            'staged:' + file.itemId,
+          ),
+          file.orphan ? ICONS.cancelled : ICONS[file.state] || ICONS.pending,
+          '<span class="name" title="' + esc(file.path) + '">' +
+            esc(file.name || file.itemId) +
+            '</span>',
+          file.orphan
+            ? '<span class="chip">无主</span>'
+            : '<span class="chip">' + esc(file.jobName || '任务') + '</span>',
+          '<span class="meta">',
+          esc(
+            label +
+              ' · 占用 ' +
+              bytes(file.diskBytes) +
+              (file.size > 0 ? ' · 已下载 ' + bytes(file.downloaded) + ' / ' + bytes(file.size) : ''),
+          ),
+          '</span>',
+          // Retrying is the point of keeping the file, so it is offered right
+          // where the file is rather than only back on the queue. Complete
+          // items have already moved their file and cannot be retried.
+          !file.orphan && !file.running && file.state !== 'complete'
+            ? '<button class="btn btn-ghost" data-retry="' +
+              esc(file.itemId) +
+              '" style="padding:.25rem .5rem;font-size:.75rem">重试</button>'
+            : '',
+          !file.running
+            ? '<button class="btn btn-ghost" data-delete-staged="' +
+              esc(file.itemId) +
+              '" style="padding:.25rem .5rem;font-size:.75rem">删除本地文件</button>'
+            : '',
+          '</div>',
+          expanded
+            ? '<dl class="detail">' +
+              (file.remotePath ? detail('云端路径', file.remotePath) : '') +
+              (file.targetPath ? detail('目标路径', file.targetPath) : '') +
+              detail('本地路径', file.path) +
+              detail('磁盘占用', bytes(file.diskBytes)) +
+              detail('已下载', file.size > 0 ? bytes(file.downloaded) + ' / ' + bytes(file.size) : bytes(file.downloaded)) +
+              detail('队列状态', file.orphan ? '队列里已经没有这条记录' : STATUS_LABEL[file.state] || '未知') +
+              detail('尝试次数', String(file.attempts || 0)) +
+              detail('最后修改', clock(file.modifiedAt)) +
+              (file.error ? detail('错误', file.error) : '') +
+              '</dl>'
+            : '',
+          '</div>',
+        ].join('')
+      }
+
+      async function deleteStaged(ids, message) {
+        try {
+          await call('/downloads/delete', { method: 'POST', body: JSON.stringify({ ids }) })
+          ids.forEach((id) => state.stagedSelected.delete(id))
+          toast(message)
+          await load(true)
+        } catch (error) {
+          toast(error.message, 'error')
+        }
       }
 
       function jobsView(snapshot) {
@@ -1090,8 +1304,18 @@
           '<div><label class="switch"><input type="checkbox" id="delete-local-after-upload"' +
             (!state.settings || state.settings.deleteLocalAfterUpload !== false ? ' checked' : '') +
             '> 上传完成后立刻删除本地暂存文件</label>' +
-            '<div class="hint">关闭后成功上传的文件会保留在暂存目录；失败或取消的传输仍会清理。</div></div>',
+            '<div class="hint">只有上传成功才会删除。上传失败的文件一律保留，可以在「下载文件」页查看和清理。</div></div>',
           '</div>',
+          '</div>',
+
+          '<div class="card">',
+          '<p class="section-title">失败重试</p>',
+          '<div class="form">',
+          field('最多尝试次数', '<input class="input" id="retry-attempts" type="number" min="1" max="100" step="1" value="' + retrySetting('maxAttempts', 5) + '">', '包含第一次尝试，填 1 表示不自动重试'),
+          field('首次重试间隔（秒）', '<input class="input" id="retry-initial" type="number" min="1" max="86400" step="1" value="' + retrySetting('initialSeconds', 30) + '">', '之后每次翻倍'),
+          field('最大重试间隔（秒）', '<input class="input" id="retry-max" type="number" min="1" max="86400" step="1" value="' + retrySetting('maxSeconds', 1800) + '">', '退避时间的上限'),
+          '</div>',
+          '<div class="hint" style="margin-top:.5rem">下载和上传失败都会自动重试，已经下好的部分会保留下来续传，不会从头再来。次数用完才会记成「失败」，本地文件依然保留。重试的唤醒跟着 30 秒一次的调度走，所以实际等待会比设定值多最多 30 秒。</div>',
           '</div>',
 
           '<div class="toolbar"><span class="grow"></span><button class="btn btn-primary" id="save-plan" type="button">保存</button></div>',
@@ -1115,6 +1339,14 @@
 
       function currentResetAt() {
         return (state.settings && state.settings.quota && state.settings.quota.resetAt) || '00:00'
+      }
+
+      // retrySetting falls back to the server's own defaults, because a
+      // configuration written before this section existed has no retry object
+      // at all and an empty number input would save a zero over it.
+      function retrySetting(key, fallback) {
+        const retry = state.settings && state.settings.retry
+        return retry && retry[key] > 0 ? retry[key] : fallback
       }
 
       function field(label, control, hint) {
@@ -1370,7 +1602,7 @@
       // --------------------------------------------------------------- events
 
       document.addEventListener('click', async (event) => {
-        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-check],[data-pick-file],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
+        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-check],[data-delete-staged],[data-pick-file],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
         if (!target) return
 
         if (target.dataset.check !== undefined) {
@@ -1378,9 +1610,32 @@
           // anywhere else on the row does.
           event.stopPropagation()
           const id = target.dataset.check
-          if (state.selected.has(id)) state.selected.delete(id)
-          else state.selected.add(id)
+          // The two lists share item ids but not their selections, so a staged
+          // file's tick is prefixed rather than pooled with the queue's.
+          if (id.startsWith('staged:')) {
+            const itemID = id.slice('staged:'.length)
+            if (state.stagedSelected.has(itemID)) state.stagedSelected.delete(itemID)
+            else state.stagedSelected.add(itemID)
+          } else if (state.selected.has(id)) {
+            state.selected.delete(id)
+          } else {
+            state.selected.add(id)
+          }
           render()
+          return
+        }
+        if (target.dataset.deleteStaged) {
+          event.stopPropagation()
+          const file = ((state.downloads && state.downloads.files) || []).find(
+            (entry) => entry.itemId === target.dataset.deleteStaged,
+          )
+          const name = (file && (file.name || file.itemId)) || target.dataset.deleteStaged
+          const warning =
+            file && file.complete && file.state !== 'complete'
+              ? '「' + name + '」已经下载完成，只差上传。删掉本地文件意味着重试时要从阿里云盘重新下一遍。确定删除吗？'
+              : '删除「' + name + '」的本地文件？队列记录会保留，重试会重新下载。'
+          if (!window.confirm(warning)) return
+          await deleteStaged([target.dataset.deleteStaged], '本地文件已删除')
           return
         }
         if (target.dataset.pickFile !== undefined) {
@@ -1395,6 +1650,13 @@
           state.tab = target.dataset.tab
           localStorage.setItem('tdrive.aliyunpan.tab', state.tab)
           if (state.tab === 'plan') await loadSettings()
+          if (state.tab === 'downloads') {
+            // Entering the tab has to fetch its data, which the previous poll
+            // deliberately skipped.
+            render()
+            await load(true)
+            return
+          }
           render()
           return
         }
@@ -1484,8 +1746,54 @@
             state.selected.clear()
             render()
             return
+          case 'select-all-staged': {
+            const files = ((state.downloads && state.downloads.files) || []).map((file) => file.itemId)
+            const allChosen = files.length > 0 && files.every((id) => state.stagedSelected.has(id))
+            if (allChosen) files.forEach((id) => state.stagedSelected.delete(id))
+            else files.forEach((id) => state.stagedSelected.add(id))
+            render()
+            return
+          }
+          case 'clear-staged-selection':
+            state.stagedSelected.clear()
+            render()
+            return
+          case 'bulk-delete-staged': {
+            const removable = ((state.downloads && state.downloads.files) || []).filter(
+              (file) => state.stagedSelected.has(file.itemId) && !file.running,
+            )
+            if (removable.length === 0) {
+              toast('选中的文件都在传输中，请先取消', 'error')
+              return
+            }
+            const total = removable.reduce((sum, file) => sum + file.diskBytes, 0)
+            if (
+              !window.confirm(
+                '删除 ' + removable.length + ' 个本地文件，释放 ' + bytes(total) +
+                  '？队列记录会保留，重试会重新下载。',
+              )
+            ) {
+              return
+            }
+            await deleteStaged(removable.map((file) => file.itemId), '本地文件已删除')
+            return
+          }
+          case 'prune-staged':
+            if (!window.confirm('删除队列里已经没有对应记录的暂存文件？这些文件不属于任何一条传输。')) return
+            try {
+              const result = await call('/downloads/prune', { method: 'POST' })
+              toast('已清理 ' + result.count + ' 项，释放 ' + bytes(result.bytes))
+              await load(true)
+            } catch (error) {
+              toast(error.message, 'error')
+            }
+            return
           case 'bulk-retry':
-            await bulkQueue('/queue/retry', (row) => row.state !== 'running', '已重新排队')
+            await bulkQueue(
+              '/queue/retry',
+              (row) => row.state !== 'running' && row.state !== 'complete',
+              '已重新排队',
+            )
             return
           case 'bulk-cancel': {
             const stopping = selectedRows().filter((row) => !FINISHED_STATES.has(row.state))
@@ -1705,6 +2013,11 @@
           downloadRate: value('download-rate'),
           downloadConcurrency,
           deleteLocalAfterUpload: checked('delete-local-after-upload'),
+          retry: {
+            maxAttempts: Math.round(Number(value('retry-attempts') || 5)),
+            initialSeconds: Math.round(Number(value('retry-initial') || 30)),
+            maxSeconds: Math.round(Number(value('retry-max') || 1800)),
+          },
           schedule: {
             ...state.settings.schedule,
             enabled: checked('schedule-enabled'),

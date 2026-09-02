@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,22 +316,29 @@ func TestSuccessfulUploadLocalCleanupPolicy(t *testing.T) {
 	}
 }
 
-func TestCancelledTransferIsRequeuedFromUpload(t *testing.T) {
-	engine := &Engine{host: hostapi.New(&zeroSegmentHost{})}
+func TestFailedUploadIsRequeuedWithBackoff(t *testing.T) {
+	engine := &Engine{
+		host:     hostapi.New(&zeroSegmentHost{}),
+		settings: settings.Settings{Retry: settings.Retry{MaxAttempts: 5, InitialSeconds: 30, MaxSeconds: 1800}},
+	}
 	item := &Item{
 		State:       StateRunning,
 		Stage:       StageUploading,
 		Downloaded:  20,
 		Uploaded:    10,
 		UploadJobID: "upload-1",
+		Attempts:    1,
 		Error:       "old error",
 		FinishedAt:  123,
 	}
 
-	engine.deferUntilRetry(context.Background(), item, context.Canceled)
+	before := nowMillis()
+	if wake := engine.retryLater(context.Background(), item, errors.New("telegram 抽风")); wake {
+		t.Fatal("a transfer parked until a deadline has nothing for the scheduler to take yet")
+	}
 
 	if item.State != StatePending || item.Stage != StageIdle {
-		t.Fatalf("cancelled item state = %s/%s, want pending/idle", item.State, item.Stage)
+		t.Fatalf("requeued item state = %s/%s, want pending/idle", item.State, item.Stage)
 	}
 	if item.Uploaded != 0 || item.UploadJobID != "" || item.FinishedAt != 0 {
 		t.Fatalf("requeued item retained upload state: %+v", item)
@@ -339,6 +347,58 @@ func TestCancelledTransferIsRequeuedFromUpload(t *testing.T) {
 	// instead of downloading the file a second time.
 	if item.Downloaded != 20 {
 		t.Fatalf("requeued item downloaded = %d, want the staged bytes to be kept", item.Downloaded)
+	}
+	// One attempt has been made, so the wait is the initial interval give or
+	// take the jitter that keeps a batch of transfers from returning together.
+	earliest := before + int64((30*time.Second - 6*time.Second).Milliseconds())
+	latest := nowMillis() + int64((30*time.Second + 6*time.Second).Milliseconds())
+	if item.NextAttemptAt < earliest || item.NextAttemptAt > latest {
+		t.Fatalf("next attempt at %d, want within [%d, %d]", item.NextAttemptAt, earliest, latest)
+	}
+	if !strings.Contains(item.Error, "telegram 抽风") {
+		t.Fatalf("requeued item error = %q, want it to name the failure", item.Error)
+	}
+}
+
+// The budget is what stops a genuinely broken transfer from cycling forever.
+// Spending it has to produce a plain failure, and it must not take the download
+// with it.
+func TestRetryBudgetExhaustionFailsTheTransfer(t *testing.T) {
+	engine := &Engine{
+		host:     hostapi.New(&zeroSegmentHost{}),
+		settings: settings.Settings{Retry: settings.Retry{MaxAttempts: 3, InitialSeconds: 30, MaxSeconds: 1800}},
+	}
+	item := &Item{State: StateRunning, Stage: StageUploading, Downloaded: 20, Attempts: 3}
+
+	if wake := engine.retryLater(context.Background(), item, errors.New("上传失败")); !wake {
+		t.Fatal("a transfer that has finally failed should wake the scheduler")
+	}
+	if item.State != StateFailed {
+		t.Fatalf("state = %s, want failed once the budget is spent", item.State)
+	}
+	if item.NextAttemptAt != 0 {
+		t.Fatalf("next attempt = %d, want no pending backoff on a failed item", item.NextAttemptAt)
+	}
+	if item.Downloaded != 20 {
+		t.Fatalf("downloaded = %d, want the local file to be kept for a manual retry", item.Downloaded)
+	}
+	if !strings.Contains(item.Error, "上传失败") {
+		t.Fatalf("error = %q, want it to name the underlying failure", item.Error)
+	}
+}
+
+// MaxAttempts of 1 is how an operator turns automatic retries off. It has to
+// mean "one attempt", not "one retry".
+func TestRetryCanBeTurnedOff(t *testing.T) {
+	engine := &Engine{
+		host:     hostapi.New(&zeroSegmentHost{}),
+		settings: settings.Settings{Retry: settings.Retry{MaxAttempts: 1, InitialSeconds: 30, MaxSeconds: 1800}},
+	}
+	item := &Item{State: StateRunning, Attempts: 1}
+
+	engine.retryLater(context.Background(), item, errors.New("下载失败"))
+	if item.State != StateFailed {
+		t.Fatalf("state = %s, want failed when retries are disabled", item.State)
 	}
 }
 
@@ -532,9 +592,27 @@ func writePartialDownload(downloadDir, cloudPath string, size int64) error {
 
 type zeroSegmentHost struct {
 	size int64
+	data map[string]json.RawMessage
 }
 
-func (host *zeroSegmentHost) Call(context.Context, string, any, any) error { return nil }
+func (host *zeroSegmentHost) Call(_ context.Context, method string, request any, response any) error {
+	if method == "data.get" && host.data != nil {
+		payload, _ := json.Marshal(request)
+		var input struct {
+			Key string `json:"key"`
+		}
+		_ = json.Unmarshal(payload, &input)
+		val, ok := host.data[input.Key]
+		if ok && response != nil {
+			if target, isRaw := response.(*json.RawMessage); isRaw {
+				*target = val
+				return nil
+			}
+			return json.Unmarshal(val, response)
+		}
+	}
+	return nil
+}
 
 func (host *zeroSegmentHost) OpenStream(_ context.Context, method string, request any) (io.ReadWriteCloser, error) {
 	if method != "files.putSegment" {
@@ -625,5 +703,474 @@ func TestTrimHistoryKeepsActiveItems(t *testing.T) {
 	}
 	if found["0"] {
 		t.Error("the oldest finished item should have been dropped first")
+	}
+}
+
+// A file inside its retry backoff must not hold up the queue behind it. That
+// is the opposite of the quota rule, which deliberately does block, and getting
+// them the same way round would let one broken file stall everything.
+func TestTakeNextSkipsBackoffWithoutBlockingTheQueue(t *testing.T) {
+	job := settings.Job{ID: "j1", Name: "job", Enabled: true, RemotePath: "/a", TargetPath: "/b"}
+	engine := &Engine{settings: settings.Settings{Jobs: []settings.Job{job}}}
+	waiting := &Item{ID: "waiting", JobID: "j1", State: StatePending, NextAttemptAt: nowMillis() + 60_000}
+	ready := &Item{ID: "ready", JobID: "j1", State: StatePending}
+	engine.queue = []*Item{waiting, ready}
+
+	taken := engine.takeNext(4)
+	if taken == nil || taken.ID != "ready" {
+		t.Fatalf("takeNext returned %v, want the item behind the backing-off one", taken)
+	}
+	if waiting.State != StatePending {
+		t.Fatalf("backing-off item state = %s, want it left alone", waiting.State)
+	}
+
+	// Once the deadline passes it is claimed like anything else, and claiming it
+	// clears the deadline so a crash mid-transfer does not leave it parked.
+	engine.active = 0
+	waiting.NextAttemptAt = nowMillis() - 1
+	taken = engine.takeNext(4)
+	if taken == nil || taken.ID != "waiting" {
+		t.Fatalf("takeNext returned %v, want the item whose backoff has elapsed", taken)
+	}
+	if taken.NextAttemptAt != 0 {
+		t.Fatalf("claimed item still carries a deadline: %d", taken.NextAttemptAt)
+	}
+	if taken.Attempts != 1 {
+		t.Fatalf("attempts = %d, want the claim to count as one", taken.Attempts)
+	}
+}
+
+// Asking for a retry by hand says the operator has dealt with whatever broke,
+// so the spent budget has to come back with it.
+func TestManualRetryRestoresTheAttemptBudget(t *testing.T) {
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{})}
+	item := &Item{
+		ID: "item-1", State: StateFailed, Attempts: 5,
+		NextAttemptAt: nowMillis() + 60_000, Error: "上传失败", FinishedAt: 123,
+	}
+	engine.queue = []*Item{item}
+
+	if err := engine.Retry(context.Background(), "item-1"); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	if item.State != StatePending {
+		t.Fatalf("state = %s, want pending", item.State)
+	}
+	if item.Attempts != 0 || item.NextAttemptAt != 0 {
+		t.Fatalf("attempts = %d, nextAttemptAt = %d; want both cleared", item.Attempts, item.NextAttemptAt)
+	}
+}
+
+// The whole point of keeping a download after a failed upload is that the retry
+// does not pay for it again. Removing the row is the one thing that has to take
+// the bytes with it, or they sit against the staging limit unseen.
+func TestRemovingAQueueRowFreesItsStagedFile(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: dataDir}
+	item := &Item{ID: "item-1", State: StateFailed, RemotePath: "/a/file.bin", Size: 6}
+	engine.queue = []*Item{item}
+
+	directory := itemStageDir(engine.StageDir(), item.ID)
+	staged := aliyunpan.StagedPath(directory, item.RemotePath)
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(staged, []byte("staged"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	engine.ClearFinished(context.Background(), "item-1")
+
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("staging directory survived the row that referred to it: %v", err)
+	}
+}
+
+// The 下载文件 page has to describe both numbers: what a file occupies and what
+// of it has actually arrived. They differ because a .part is pre-allocated at
+// the final size from the first moment.
+func TestDownloadsReportsDiskUseAndOrphans(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: dataDir}
+	known := &Item{
+		ID: "item-1", State: StateFailed, JobName: "job", Name: "file.bin",
+		RemotePath: "/a/file.bin", TargetDir: "/target", Size: 6, Error: "上传失败",
+	}
+	engine.queue = []*Item{known}
+
+	stageDir := engine.StageDir()
+	knownDir := itemStageDir(stageDir, "item-1")
+	staged := aliyunpan.StagedPath(knownDir, known.RemotePath)
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(staged, []byte("staged"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	orphanDir := itemStageDir(stageDir, "item-gone")
+	if err := os.MkdirAll(orphanDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll orphan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, "left.bin"), []byte("abcd"), 0o600); err != nil {
+		t.Fatalf("WriteFile orphan: %v", err)
+	}
+
+	view := engine.Downloads(context.Background())
+	if len(view.Files) != 2 {
+		t.Fatalf("files = %d, want the known item and the orphan", len(view.Files))
+	}
+	if view.UsedBytes != 10 {
+		t.Fatalf("usedBytes = %d, want 10", view.UsedBytes)
+	}
+	if view.OrphanCount != 1 || view.OrphanBytes != 4 {
+		t.Fatalf("orphans = %d / %d bytes, want 1 / 4", view.OrphanCount, view.OrphanBytes)
+	}
+
+	byID := map[string]StagedFile{}
+	for _, file := range view.Files {
+		byID[file.ItemID] = file
+	}
+	if got := byID["item-1"]; !got.Complete || got.Downloaded != 6 || got.DiskBytes != 6 {
+		t.Fatalf("known file = %+v, want a complete 6-byte download", got)
+	}
+	if got := byID["item-1"]; got.Orphan || got.JobName != "job" || got.Error == "" {
+		t.Fatalf("known file lost its queue context: %+v", got)
+	}
+	if got := byID["item-gone"]; !got.Orphan {
+		t.Fatal("a directory with no queue row should be reported as an orphan")
+	}
+
+	// Pruning takes the orphan and leaves the file somebody can still retry.
+	removed, freed := engine.PruneStaged()
+	if removed != 1 || freed != 4 {
+		t.Fatalf("prune removed %d / %d bytes, want 1 / 4", removed, freed)
+	}
+	if _, err := os.Stat(staged); err != nil {
+		t.Fatalf("pruning took a file the queue still refers to: %v", err)
+	}
+}
+
+// Deleting a running transfer's file out from under it would corrupt the upload
+// in flight, so it is refused rather than obeyed.
+func TestDeleteStagedRefusesARunningTransfer(t *testing.T) {
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: t.TempDir()}
+	engine.queue = []*Item{{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin"}}
+
+	if _, err := engine.DeleteStaged(context.Background(), "item-1"); err == nil {
+		t.Fatal("deleting a running transfer's staged file should be refused")
+	}
+}
+
+func TestDeleteStagedKeepsTheQueueRow(t *testing.T) {
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: t.TempDir()}
+	item := &Item{ID: "item-1", State: StateFailed, RemotePath: "/a/file.bin", Size: 6, Downloaded: 6}
+	engine.queue = []*Item{item}
+
+	directory := itemStageDir(engine.StageDir(), item.ID)
+	staged := aliyunpan.StagedPath(directory, item.RemotePath)
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(staged, []byte("staged"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	deleted, err := engine.DeleteStaged(context.Background(), "item-1")
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteStaged = %d, %v; want 1, nil", deleted, err)
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("staged file survived an explicit delete: %v", err)
+	}
+	if len(engine.queue) != 1 {
+		t.Fatal("deleting the local file must not delete the queue record it belongs to")
+	}
+	if item.Downloaded != 0 {
+		t.Fatalf("downloaded = %d, want the progress reset once the bytes are gone", item.Downloaded)
+	}
+}
+
+// stageOneItem plants a fully downloaded file where a transfer would have left
+// it, and returns the item's private staging directory.
+func stageOneItem(t *testing.T, engine *Engine, item *Item) string {
+	t.Helper()
+	directory := itemStageDir(engine.StageDir(), item.ID)
+	staged := aliyunpan.StagedPath(directory, item.RemotePath)
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(staged, []byte("staged"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return directory
+}
+
+func retryingEngine(t *testing.T, attempts int) *Engine {
+	t.Helper()
+	return &Engine{
+		host:       hostapi.New(&zeroSegmentHost{}),
+		dataDir:    t.TempDir(),
+		cancels:    map[string]context.CancelFunc{},
+		cancelling: map[string]bool{},
+		settings: settings.Settings{
+			Retry: settings.Retry{MaxAttempts: attempts, InitialSeconds: 30, MaxSeconds: 1800},
+		},
+	}
+}
+
+// The single most expensive mistake this pipeline can make is deleting a
+// finished download because the upload after it broke. transfer's deferred
+// cleanup is where that decision lives, so it is driven here end to end rather
+// than asserted on the helpers underneath it.
+func TestFailedTransferKeepsWhatItAlreadyDownloaded(t *testing.T) {
+	engine := retryingEngine(t, 5)
+	// No CLI is configured, so staging fails with an ordinary retryable error —
+	// which is exactly the shape of the network failures this has to survive.
+	item := &Item{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin", Size: 6, Attempts: 1}
+	engine.queue = []*Item{item}
+	directory := stageOneItem(t, engine, item)
+
+	if wake := engine.transfer(context.Background(), item, hostapi.RuntimeSettings{UploadConcurrency: 1}); wake {
+		t.Fatal("a transfer parked until its backoff has nothing for the scheduler yet")
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("a failed transfer deleted what it had already downloaded: %v", err)
+	}
+	if item.State != StatePending || item.NextAttemptAt == 0 {
+		t.Fatalf("item = %s with next attempt %d, want it queued behind a backoff", item.State, item.NextAttemptAt)
+	}
+}
+
+// Once the budget is spent the transfer is a failure, but the bytes are still
+// the expensive half of the job and the operator may yet fix whatever broke.
+func TestExhaustedTransferStillKeepsItsLocalFile(t *testing.T) {
+	engine := retryingEngine(t, 1)
+	item := &Item{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin", Size: 6, Attempts: 1}
+	engine.queue = []*Item{item}
+	directory := stageOneItem(t, engine, item)
+
+	if wake := engine.transfer(context.Background(), item, hostapi.RuntimeSettings{UploadConcurrency: 1}); !wake {
+		t.Fatal("a transfer that has finally failed should wake the scheduler")
+	}
+	if item.State != StateFailed {
+		t.Fatalf("state = %s, want failed once the budget is spent", item.State)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("a permanently failed transfer deleted its local file: %v", err)
+	}
+}
+
+// Cancelling is the one failure that is a decision rather than an accident, and
+// it is still what throws the partial work away.
+func TestCancelledTransferDiscardsItsStagedWork(t *testing.T) {
+	engine := retryingEngine(t, 5)
+	item := &Item{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin", Size: 6}
+	engine.queue = []*Item{item}
+	directory := stageOneItem(t, engine, item)
+	engine.cancelling[item.ID] = true
+
+	engine.transfer(context.Background(), item, hostapi.RuntimeSettings{UploadConcurrency: 1})
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("a cancelled transfer left its partial download behind: %v", err)
+	}
+}
+
+// A source that is no longer the file this row describes cannot be fixed by
+// waiting, so it fails immediately instead of spending an hour of backoff first.
+func TestPermanentTransferErrorsAreNotRetried(t *testing.T) {
+	if !permanentTransferError(fmt.Errorf("staging: %w", aliyunpan.ErrSourceChanged)) {
+		t.Error("a changed source should not be retried")
+	}
+	if !permanentTransferError(fmt.Errorf("staging: %w", aliyunpan.ErrPathNotFound)) {
+		t.Error("a file that is no longer there should not be retried")
+	}
+	for _, err := range []error{
+		errors.New("下载分片返回 HTTP 502"),
+		context.Canceled,
+		context.DeadlineExceeded,
+		errors.New("开始上传: rpc error"),
+	} {
+		if permanentTransferError(err) {
+			t.Errorf("%v should be retried rather than failed outright", err)
+		}
+	}
+}
+
+// takeNext charges an attempt the moment it claims an item, so every requeue
+// that is not the transfer's own fault has to give that attempt back. Without
+// this a handful of plugin restarts, or a staging disk that stayed full for an
+// hour, would exhaust the budget of a file that had never actually failed.
+func TestRequeueOnlyChargesRealFailures(t *testing.T) {
+	engine := retryingEngine(t, 5)
+	item := &Item{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin"}
+	engine.queue = []*Item{item}
+
+	for name, requeue := range map[string]func(){
+		"no login":       func() { engine.deferUntilLogin(context.Background(), item) },
+		"no stage room":  func() { engine.deferUntilResource(context.Background(), item, ErrStageRoom) },
+		"plugin restart": func() { engine.deferUntilRestart(context.Background(), item) },
+	} {
+		item.Attempts = 3
+		requeue()
+		if item.Attempts != 2 {
+			t.Errorf("%s: attempts = %d, want the claim's charge refunded to 2", name, item.Attempts)
+		}
+	}
+
+	// A real failure keeps the charge.
+	item.Attempts = 3
+	engine.retryLater(context.Background(), item, errors.New("下载分片返回 HTTP 502"))
+	if item.Attempts != 3 {
+		t.Errorf("attempts = %d, want a genuine failure to stay charged", item.Attempts)
+	}
+}
+
+// Shutting the plugin down interrupts every running transfer at once. None of
+// them failed, so none of them should be charged or made to wait.
+func TestShutdownRequeuesWithoutChargingOrWaiting(t *testing.T) {
+	engine := retryingEngine(t, 5)
+	item := &Item{ID: "item-1", State: StateRunning, RemotePath: "/a/file.bin", Attempts: 1}
+	engine.queue = []*Item{item}
+	engine.stopping = true
+	directory := stageOneItem(t, engine, item)
+
+	engine.transfer(context.Background(), item, hostapi.RuntimeSettings{UploadConcurrency: 1})
+
+	if item.State != StatePending {
+		t.Fatalf("state = %s, want pending", item.State)
+	}
+	if item.Attempts != 0 {
+		t.Fatalf("attempts = %d, want the shutdown not to count against the budget", item.Attempts)
+	}
+	if item.NextAttemptAt != 0 {
+		t.Fatalf("nextAttemptAt = %d, want no backoff across a restart", item.NextAttemptAt)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("a shutdown discarded the partial download: %v", err)
+	}
+}
+
+// Cancelling a pending or failed item must discard its staging directory,
+// because non-running items have no transfer goroutine to run deferred cleanup.
+func TestCancelNonRunningItemDiscardsStagedWork(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: dataDir}
+	item := &Item{ID: "item-1", State: StatePending, RemotePath: "/a/file.bin", Size: 6}
+	engine.queue = []*Item{item}
+
+	directory := stageOneItem(t, engine, item)
+
+	if err := engine.Cancel(context.Background(), "item-1"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if item.State != StateCancelled {
+		t.Fatalf("state = %s, want cancelled", item.State)
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("cancelled pending item left staged directory behind: %v", err)
+	}
+}
+
+// Completed items have already moved their file and must not be retried.
+func TestRetryRejectsCompletedItems(t *testing.T) {
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{})}
+	item := &Item{ID: "item-1", State: StateComplete, RemotePath: "/a/file.bin"}
+	engine.queue = []*Item{item}
+
+	if err := engine.Retry(context.Background(), "item-1"); err == nil {
+		t.Fatal("retrying a completed item should be refused")
+	}
+	if item.State != StateComplete {
+		t.Fatalf("state = %s, want complete", item.State)
+	}
+}
+
+// A crash while running should refund the attempt when the process recovers.
+func TestLoadRefundsAttemptForRunningItems(t *testing.T) {
+	dataDir := t.TempDir()
+	host := &zeroSegmentHost{
+		data: map[string]json.RawMessage{
+			queueKey: json.RawMessage(`[{"id":"item-1","jobId":"j1","state":"running","remotePath":"/a","attempts":3}]`),
+		},
+	}
+	engine := New(hostapi.New(host), dataDir, nil)
+	if err := engine.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(engine.queue) != 1 {
+		t.Fatalf("queue len = %d, want 1", len(engine.queue))
+	}
+	recovered := engine.queue[0]
+	if recovered.State != StatePending {
+		t.Fatalf("recovered state = %s, want pending", recovered.State)
+	}
+	if recovered.Attempts != 2 {
+		t.Fatalf("recovered attempts = %d, want 2 (refunded)", recovered.Attempts)
+	}
+}
+
+// DeleteStaged must sanitize IDs and reject path traversal.
+func TestDeleteStagedRejectsTraversalIDs(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: dataDir}
+
+	for _, badID := range []string{"..", "../..", "a/b", "/etc/passwd", "foo\x00bar"} {
+		deleted, err := engine.DeleteStaged(context.Background(), badID)
+		if err == nil || deleted != 0 {
+			t.Errorf("DeleteStaged(%q) = %d, %v; want error and 0 deleted", badID, deleted, err)
+		}
+	}
+}
+
+// Cancelling a failed item must also discard its staging directory.
+func TestCancelFailedItemDiscardsStagedWork(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := &Engine{host: hostapi.New(&zeroSegmentHost{}), dataDir: dataDir}
+	item := &Item{ID: "item-1", State: StateFailed, RemotePath: "/a/file.bin", Size: 6}
+	engine.queue = []*Item{item}
+
+	directory := stageOneItem(t, engine, item)
+
+	if err := engine.Cancel(context.Background(), "item-1"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if item.State != StateCancelled {
+		t.Fatalf("state = %s, want cancelled", item.State)
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("cancelled failed item left staged directory behind: %v", err)
+	}
+}
+
+// A crash during StageFinishing should complete the item and clean up on restart.
+func TestLoadFinishesInterruptedCleanups(t *testing.T) {
+	dataDir := t.TempDir()
+	host := &zeroSegmentHost{
+		data: map[string]json.RawMessage{
+			queueKey: json.RawMessage(`[{"id":"item-1","jobId":"j1","state":"running","stage":"finishing","remotePath":"/a","size":100}]`),
+		},
+	}
+	engine := New(hostapi.New(host), dataDir, nil)
+	directory := itemStageDir(engine.StageDir(), "item-1")
+	staged := aliyunpan.StagedPath(directory, "/a")
+	_ = os.MkdirAll(filepath.Dir(staged), 0o750)
+	_ = os.WriteFile(staged, []byte("staged"), 0o600)
+
+	if err := engine.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(engine.queue) != 1 {
+		t.Fatalf("queue len = %d, want 1", len(engine.queue))
+	}
+	recovered := engine.queue[0]
+	if recovered.State != StateComplete {
+		t.Fatalf("state = %s, want complete", recovered.State)
+	}
+	if recovered.Uploaded != 100 {
+		t.Fatalf("uploaded = %d, want 100", recovered.Uploaded)
+	}
+	// Default DeleteLocalAfterUpload is true, so staged file should be cleaned up.
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("staged directory survived recovery of finishing item: %v", err)
 	}
 }
