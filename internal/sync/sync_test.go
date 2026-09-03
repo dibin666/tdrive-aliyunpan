@@ -92,26 +92,178 @@ func TestConsiderIgnoresResultsFromAnEditedJob(t *testing.T) {
 		ID: "j1", Name: "old", DriveName: settings.DefaultDriveName,
 		RemotePath: "/old", TargetPath: "/target",
 	}
-	engine.consider(oldJob, aliyunpan.Entry{
+	engine.consider(context.Background(), oldJob, aliyunpan.Entry{
 		Name: "file.bin", Path: "/old/file.bin", Size: 1,
-	}, "/target", map[string]tdriveplugin.Entry{})
+	}, "/target", map[string]tdriveplugin.Entry{}, newDriveCache(engine))
 	if len(engine.queue) != 0 {
 		t.Fatal("a scan using an old job snapshot queued stale work")
+	}
+}
+
+// listingHost answers files.list from a fixed drive tree. The drive is the
+// scan's index of what has already been synced, so this is the only thing it
+// consults to decide whether a file still needs downloading.
+type listingHost struct {
+	dirs map[string][]tdriveplugin.Entry
+	read []string
+}
+
+func (host *listingHost) Call(_ context.Context, method string, request, response any) error {
+	if method != "files.list" {
+		return nil
+	}
+	query, _ := request.(map[string]string)
+	host.read = append(host.read, query["path"])
+	entries, ok := host.dirs[query["path"]]
+	if !ok {
+		return errors.New("drive: no such file or directory")
+	}
+	target, ok := response.(*[]tdriveplugin.Entry)
+	if !ok {
+		return fmt.Errorf("unexpected files.list response %T", response)
+	}
+	*target = entries
+	return nil
+}
+
+func (host *listingHost) OpenStream(context.Context, string, any) (io.ReadWriteCloser, error) {
+	return nil, errors.New("not supported")
+}
+
+// deliveredEngine is a job that has already synced one file, set up so that the
+// destination the scan now derives for it is not the one it was delivered to.
+// Ticking a second entry in another folder is enough to move the job's cloud
+// root a level up and do exactly this.
+func deliveredEngine(host *listingHost) (*Engine, settings.Job, aliyunpan.Entry) {
+	job := settings.Job{
+		ID: "j1", Name: "动漫", DriveName: settings.DefaultDriveName,
+		RemotePath: "/粤语", TargetPath: "/动画",
+	}
+	engine := &Engine{
+		host:     hostapi.New(host),
+		settings: settings.Settings{Jobs: []settings.Job{job}},
+		queue: []*Item{{
+			ID: "already-done", JobID: "j1", JobName: "动漫",
+			RemotePath: "/粤语/庞波小姐/01.mkv", Name: "01.mkv",
+			SHA1: "6be2daf3b6b1", Size: 2720257321,
+			TargetDir: "/动画", State: StateComplete,
+		}},
+	}
+	entry := aliyunpan.Entry{
+		Name: "01.mkv", Path: "/粤语/庞波小姐/01.mkv",
+		SHA1: "6be2daf3b6b1", Size: 2720257321,
+	}
+	return engine, job, entry
+}
+
+// A file whose destination moved is still in the drive, just not where the scan
+// now looks for it. Queueing it again downloads and re-uploads every byte a
+// second time and spends the daily quota on a duplicate.
+func TestConsiderSkipsAFileAlreadyDeliveredToItsOldTarget(t *testing.T) {
+	host := &listingHost{dirs: map[string][]tdriveplugin.Entry{
+		"/动画": {{Name: "01.mkv", Size: 2720257321}},
+	}}
+	engine, job, entry := deliveredEngine(host)
+
+	engine.consider(context.Background(), job, entry,
+		"/动画/庞波小姐", map[string]tdriveplugin.Entry{}, newDriveCache(engine))
+
+	if len(engine.queue) != 1 {
+		t.Fatalf("queue = %d items, want only the completed one", len(engine.queue))
+	}
+}
+
+// The drive is the index rather than a ledger of what was once synced, so
+// deleting a file from 文件 still has to bring it back.
+func TestConsiderQueuesAFileRemovedFromItsOldTarget(t *testing.T) {
+	host := &listingHost{dirs: map[string][]tdriveplugin.Entry{"/动画": {}}}
+	engine, job, entry := deliveredEngine(host)
+
+	engine.consider(context.Background(), job, entry,
+		"/动画/庞波小姐", map[string]tdriveplugin.Entry{}, newDriveCache(engine))
+
+	if len(engine.queue) != 2 {
+		t.Fatalf("queue = %d items, want the completed one and a fresh candidate", len(engine.queue))
+	}
+	if got := engine.queue[1].TargetDir; got != "/动画/庞波小姐" {
+		t.Fatalf("re-queued target = %q, want the destination it maps onto now", got)
+	}
+}
+
+// A different file that happens to share a name is not the delivered one.
+func TestConsiderQueuesADifferentFileWithTheSameName(t *testing.T) {
+	host := &listingHost{dirs: map[string][]tdriveplugin.Entry{
+		"/动画": {{Name: "01.mkv", Size: 2720257321}},
+	}}
+	engine, job, entry := deliveredEngine(host)
+	entry.Size = 1_000_000
+	entry.SHA1 = "0000deadbeef"
+
+	engine.consider(context.Background(), job, entry,
+		"/动画/庞波小姐", map[string]tdriveplugin.Entry{}, newDriveCache(engine))
+
+	if len(engine.queue) != 2 {
+		t.Fatalf("queue = %d items, want the replacement queued", len(engine.queue))
+	}
+}
+
+// Ticking a directory and a file inside it is one click away — "全选本目录" does
+// it — so the same file reaches consider twice in one scan, once from the walk
+// of the directory and once from the file's own listing.
+func TestConsiderQueuesAFileCoveredByTwoTicksOnlyOnce(t *testing.T) {
+	host := &listingHost{dirs: map[string][]tdriveplugin.Entry{"/动画": {}}}
+	engine, job, entry := deliveredEngine(host)
+	engine.queue = nil
+	cache := newDriveCache(engine)
+
+	for round := 0; round < 2; round++ {
+		engine.consider(context.Background(), job, entry,
+			"/动画/庞波小姐", map[string]tdriveplugin.Entry{}, cache)
+	}
+	if len(engine.queue) != 1 {
+		t.Fatalf("queue = %d items, want one candidate", len(engine.queue))
+	}
+}
+
+// The check costs one host call per destination, not one per file, or a scan of
+// a full season would pay for the same listing dozens of times.
+func TestDriveCacheReadsEachDirectoryOnce(t *testing.T) {
+	host := &listingHost{dirs: map[string][]tdriveplugin.Entry{
+		"/动画": {{Name: "01.mkv", Size: 2720257321}},
+	}}
+	engine, job, entry := deliveredEngine(host)
+	cache := newDriveCache(engine)
+
+	for round := 0; round < 3; round++ {
+		engine.consider(context.Background(), job, entry,
+			"/动画/庞波小姐", map[string]tdriveplugin.Entry{}, cache)
+	}
+	if len(host.read) != 1 {
+		t.Fatalf("files.list calls = %v, want the old destination read once", host.read)
 	}
 }
 
 func TestSettingsReturnsAnIndependentJobSlice(t *testing.T) {
 	engine := &Engine{settings: settings.Settings{Jobs: []settings.Job{{
 		ID: "j1", RemotePath: "/a", TargetPath: "/b", ExcludeNames: []string{"old"},
+		IncludeFiles: []string{"/a/one.mkv"}, IncludeDirs: []string{"/a/season"},
 	}}}}
 	copy := engine.Settings()
 	copy.Jobs[0].Name = "changed"
 	copy.Jobs[0].ExcludeNames[0] = "changed"
+	copy.Jobs[0].IncludeFiles[0] = "changed"
+	copy.Jobs[0].IncludeDirs[0] = "changed"
 	if got := engine.settings.Jobs[0].Name; got == "changed" {
 		t.Fatal("Settings exposed the engine's job slice")
 	}
 	if got := engine.settings.Jobs[0].ExcludeNames[0]; got == "changed" {
 		t.Fatal("Settings exposed the engine's exclude slice")
+	}
+	if got := engine.settings.Jobs[0].IncludeFiles[0]; got == "changed" {
+		t.Fatal("Settings exposed the engine's picked-file slice")
+	}
+	if got := engine.settings.Jobs[0].IncludeDirs[0]; got == "changed" {
+		t.Fatal("Settings exposed the engine's picked-directory slice")
 	}
 }
 

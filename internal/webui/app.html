@@ -371,6 +371,23 @@
         font-size: 0.75rem;
         white-space: nowrap;
       }
+      /* A directory can be both entered and ticked, so its row is two targets
+         rather than the one row-wide button a file gets. */
+      .picker-row {
+        display: flex;
+        align-items: center;
+      }
+      .picker-row:hover {
+        background: var(--sunk);
+      }
+      .picker .picker-row .check-hit {
+        width: auto;
+        margin: 0;
+        padding: 0.4375rem 0 0.4375rem 0.625rem;
+      }
+      .picker .picker-row button[data-picker-go] {
+        padding-left: 0.5rem;
+      }
 
       /* The multi-select box, drawn rather than native so it can show the
          indeterminate state a partly-selected "select all" needs, and so it
@@ -1239,9 +1256,7 @@
                     esc(job.targetPath) +
                     '</div>' +
                     '</div>' +
-                    ((job.includeFiles || []).length > 0
-                      ? '<span class="chip">只同步 ' + job.includeFiles.length + ' 个文件</span>'
-                      : '') +
+                    (selectionChip(job) ? '<span class="chip">' + selectionChip(job) + '</span>' : '') +
                     (job.deleteAfterUpload
                       ? '<span class="chip danger-text">上传后删除云端</span>'
                       : '') +
@@ -1440,7 +1455,9 @@
         const key = state.picker
           ? ['picker', state.picker.request, state.picker.kind, state.picker.driveName, state.picker.path, state.picker.loading, state.picker.error, state.picker.chosen.size].join('|')
           : state.editing
-            ? 'job|' + (state.editing.id || 'new') + '|' + ((state.editing.includeFiles || []).length)
+            ? 'job|' + (state.editing.id || 'new') +
+              '|' + ((state.editing.includeFiles || []).length) +
+              '|' + ((state.editing.includeDirs || []).length)
             : ''
         if (!force && key === overlayKey) return
         overlayKey = key
@@ -1508,23 +1525,33 @@
 
       /**
        * includedFilesField reports whether the job is mirroring a directory or
-       * syncing a hand-picked list, because those behave very differently and
-       * the difference is otherwise invisible on the form.
+       * syncing a hand-picked selection, because those behave very differently
+       * and the difference is otherwise invisible on the form.
        */
       function includedFilesField(job) {
+        const dirs = job.includeDirs || []
         const files = job.includeFiles || []
-        if (files.length === 0) {
-          return '<div class="hint">同步整个目录（含子目录）。用「浏览」勾选文件可以只同步其中几个。</div>'
+        const picked = [...dirs.map((path) => path + '/'), ...files]
+        if (picked.length === 0) {
+          return '<div class="hint">同步整个目录（含子目录）。用「浏览」勾选目录或文件可以只同步其中几项。</div>'
         }
-        const preview = files.slice(0, 6).map((path) => '<div>' + esc(path) + '</div>').join('')
+        const counts = [
+          dirs.length > 0 ? dirs.length + ' 个目录' : '',
+          files.length > 0 ? files.length + ' 个文件' : '',
+        ].filter(Boolean).join('、')
+        const preview = picked.slice(0, 6).map((path) => '<div>' + esc(path) + '</div>').join('')
         return (
           '<div class="warn-box" style="margin-top:.5rem">' +
-          '<div class="toolbar"><span>只同步勾选的 ' + files.length + ' 个文件</span><span class="grow"></span>' +
+          '<div class="toolbar"><span>只同步勾选的 ' + counts + '</span><span class="grow"></span>' +
           '<button class="btn btn-ghost" id="job-clear-files" type="button" style="padding:.125rem .375rem;font-size:.75rem">改为整个目录</button></div>' +
           '<div class="mono" style="margin-top:.375rem;color:inherit">' +
           preview +
-          (files.length > 6 ? '<div>…还有 ' + (files.length - 6) + ' 个</div>' : '') +
-          '</div></div>'
+          (picked.length > 6 ? '<div>…还有 ' + (picked.length - 6) + ' 项</div>' : '') +
+          '</div>' +
+          (dirs.length > 0
+            ? '<div class="hint" style="margin:.375rem 0 0">勾选的目录会连同子目录一起同步，目录结构原样保留到目标目录下。</div>'
+            : '') +
+          '</div>'
         )
       }
 
@@ -1532,21 +1559,38 @@
         const remote = picker.kind === 'remote'
         const chosen = picker.chosen ? picker.chosen.size : 0
         const entries = picker.entries || []
-        const files = entries.filter((entry) => !entry.isDir)
-        const allFilesChosen = files.length > 0 && files.every((entry) => picker.chosen.has(entry.path))
+        const here = remote ? entries : []
+        const allHereChosen = here.length > 0 && here.every((entry) => picker.chosen.has(entry.path))
 
         const row = (entry) => {
+          const ticked = picker.chosen.has(entry.path)
           if (entry.isDir) {
+            // The tdrive side is only ever a destination, so a directory there
+            // is entered and nothing else.
+            if (!remote) {
+              return (
+                '<button data-picker-go="' + esc(entry.path) + '" type="button">📁 ' +
+                esc(entry.name) + '</button>'
+              )
+            }
+            // A cloud directory can be entered or taken whole, so the tick and
+            // the way in are separate targets on the same row.
             return (
+              '<div class="picker-row">' +
+              '<button class="check-hit" data-pick-dir="' + esc(entry.path) + '" type="button" ' +
+              'aria-label="勾选整个目录" title="连同子目录一起同步">' +
+              '<span class="check" data-on="' + (ticked ? 'true' : 'false') + '">' +
+              (ticked ? '✓' : '') +
+              '</span></button>' +
               '<button data-picker-go="' + esc(entry.path) + '" type="button">📁 ' +
-              esc(entry.name) + '</button>'
+              esc(entry.name) + '</button></div>'
             )
           }
           // A file is ticked, not entered, so the whole row toggles it.
           return (
             '<button data-pick-file="' + esc(entry.path) + '" type="button">' +
-            '<span class="check" data-on="' + (picker.chosen.has(entry.path) ? 'true' : 'false') + '">' +
-            (picker.chosen.has(entry.path) ? '✓' : '') +
+            '<span class="check" data-on="' + (ticked ? 'true' : 'false') + '">' +
+            (ticked ? '✓' : '') +
             '</span>📄 ' + esc(entry.name) +
             '<span class="size">' + esc(bytes(entry.size)) + '</span></button>'
           )
@@ -1557,18 +1601,18 @@
           '<h2>' + (remote ? '选择' + driveLabel(picker.driveName) + '目录或文件' : '选择 tdrive 目录') + '</h2>',
           '<div class="mono" style="margin-bottom:.5rem">' + esc(picker.path) + '</div>',
           remote
-            ? '<div class="hint" style="margin:-.25rem 0 .5rem">不勾选任何文件就同步整个目录；勾选之后只同步勾选的这些，勾选可以跨目录保留。</div>'
+            ? '<div class="hint" style="margin:-.25rem 0 .5rem">不勾选任何内容就同步整个目录；勾选目录会连同它的子目录一起同步，勾选可以跨目录保留。</div>'
             : '',
           picker.error ? '<div class="error-box">' + esc(picker.error) + '</div>' : '',
-          remote && files.length > 0 && !picker.loading
+          remote && here.length > 0 && !picker.loading
             ? '<div class="toolbar" style="margin-bottom:.375rem">' +
               checkbox(
-                allFilesChosen ? 'true' : chosen > 0 ? 'mixed' : 'false',
+                allHereChosen ? 'true' : chosen > 0 ? 'mixed' : 'false',
                 'picker-select-all',
-                allFilesChosen ? '取消全选' : '全选本目录文件',
+                allHereChosen ? '取消全选' : '全选本目录',
               ) +
               '<span class="hint" style="margin:0">' +
-              (chosen > 0 ? '已勾选 ' + chosen + ' 个文件' : files.length + ' 个文件') +
+              (chosen > 0 ? '已勾选 ' + chosen + ' 项' : here.length + ' 项') +
               '</span></div>'
             : '',
           '<div class="picker" data-picker-path="' + esc(picker.path) + '">',
@@ -1586,7 +1630,7 @@
             : '',
           '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
           '<button class="btn btn-primary" id="picker-choose" type="button">' +
-            (chosen > 0 ? '使用勾选的 ' + chosen + ' 个文件' : '选择当前目录') +
+            (chosen > 0 ? '使用勾选的 ' + chosen + ' 项' : '选择当前目录') +
             '</button>',
           '</div>',
           '</div></div>',
@@ -1602,7 +1646,7 @@
       // --------------------------------------------------------------- events
 
       document.addEventListener('click', async (event) => {
-        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-check],[data-delete-staged],[data-pick-file],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
+        const target = event.target.closest('[data-tab],[data-filter],[data-row],[data-retry],[data-cancel],[data-check],[data-delete-staged],[data-pick-file],[data-pick-dir],[data-edit-job],[data-delete-job],[data-pick],[data-picker-go],[data-close-modal],button,a')
         if (!target) return
 
         if (target.dataset.check !== undefined) {
@@ -1638,11 +1682,10 @@
           await deleteStaged([target.dataset.deleteStaged], '本地文件已删除')
           return
         }
-        if (target.dataset.pickFile !== undefined) {
+        if (target.dataset.pickFile !== undefined || target.dataset.pickDir !== undefined) {
           event.stopPropagation()
-          const path = target.dataset.pickFile
-          if (state.picker.chosen.has(path)) state.picker.chosen.delete(path)
-          else state.picker.chosen.add(path)
+          const isDir = target.dataset.pickDir !== undefined
+          togglePicked(isDir ? target.dataset.pickDir : target.dataset.pickFile, isDir)
           renderOverlay(true)
           return
         }
@@ -1818,7 +1861,7 @@
           case 'new-job':
             state.editing = {
               enabled: true, driveName: 'backup', remotePath: '/',
-              targetPath: '/阿里云盘', includeFiles: [],
+              targetPath: '/阿里云盘', includeFiles: [], includeDirs: [],
             }
             renderOverlay(true)
             return
@@ -1828,17 +1871,18 @@
           case 'job-clear-files':
             captureJobForm()
             state.editing.includeFiles = []
+            state.editing.includeDirs = []
             renderOverlay(true)
             return
           case 'picker-choose':
             applyPicker()
             return
           case 'picker-select-all': {
-            const files = (state.picker.entries || []).filter((entry) => !entry.isDir)
-            const allChosen = files.length > 0 && files.every((entry) => state.picker.chosen.has(entry.path))
-            files.forEach((entry) => {
+            const here = state.picker.entries || []
+            const allChosen = here.length > 0 && here.every((entry) => state.picker.chosen.has(entry.path))
+            here.forEach((entry) => {
               if (allChosen) state.picker.chosen.delete(entry.path)
-              else state.picker.chosen.add(entry.path)
+              else state.picker.chosen.set(entry.path, entry.isDir ? 'dir' : 'file')
             })
             renderOverlay(true)
             return
@@ -1960,10 +2004,24 @@
         return element ? element.checked : false
       }
 
+      /** selectionChip summarises a job's ticked entries for the task list. */
+      function selectionChip(job) {
+        const dirs = (job.includeDirs || []).length
+        const files = (job.includeFiles || []).length
+        if (dirs + files === 0) return ''
+        return (
+          '只同步 ' +
+          [dirs > 0 ? dirs + ' 个目录' : '', files > 0 ? files + ' 个文件' : '']
+            .filter(Boolean)
+            .join('、')
+        )
+      }
+
       function captureJobForm() {
         if (!state.editing) return
-        // includeFiles has no input of its own — it comes from the picker — so
-        // it rides along on the spread rather than being read back off the form.
+        // includeFiles and includeDirs have no input of their own — they come
+        // from the picker — so they ride along on the spread rather than being
+        // read back off the form.
         state.editing = {
           ...state.editing,
           name: value('job-name'),
@@ -2041,12 +2099,25 @@
       }
 
       /**
+       * togglePicked ticks or unticks one cloud entry.
+       *
+       * What was ticked is remembered along with whether it was a file or a
+       * directory, because the picker only ever sees one directory's entries at
+       * a time and the two are synced differently — a file by name, a directory
+       * whole. Re-deriving the kind later would mean another round trip per tick.
+       */
+      function togglePicked(path, isDir) {
+        if (state.picker.chosen.has(path)) state.picker.chosen.delete(path)
+        else state.picker.chosen.set(path, isDir ? 'dir' : 'file')
+      }
+
+      /**
        * openPicker browses one directory.
        *
-       * The cloud side lists files as well as directories so specific files can
-       * be ticked; the tdrive side is a destination and only ever a directory.
-       * The ticks survive navigating around, because the files somebody wants
-       * are rarely all in one folder.
+       * The cloud side lists files as well as directories so specific files or
+       * whole folders can be ticked; the tdrive side is a destination and only
+       * ever a directory. The ticks survive navigating around, because what
+       * somebody wants is rarely all in one folder.
        */
       async function openPicker(kind, path) {
         const selectedPath = path || '/'
@@ -2055,7 +2126,7 @@
         const chosen =
           state.picker && state.picker.kind === kind
             ? state.picker.chosen
-            : new Set(kind === 'remote' ? (state.editing && state.editing.includeFiles) || [] : [])
+            : pickedFromJob(kind === 'remote' ? state.editing : null)
         state.picker = {
           request, kind, driveName, chosen,
           path: selectedPath, loading: true, entries: [], error: '',
@@ -2079,13 +2150,23 @@
         renderOverlay(true)
       }
 
+      /** pickedFromJob restores a job's ticks as the picker records them. */
+      function pickedFromJob(job) {
+        const picked = new Map()
+        if (!job) return picked
+        ;(job.includeFiles || []).forEach((path) => picked.set(path, 'file'))
+        ;(job.includeDirs || []).forEach((path) => picked.set(path, 'dir'))
+        return picked
+      }
+
       /**
        * applyPicker writes the picker's result back into the job form.
        *
-       * Ticking files means "sync exactly these"; ticking none means "mirror
-       * this directory", which is what the job did before any of this existed.
-       * Both are recorded together so the two halves cannot disagree: the cloud
-       * directory is always the one being looked at when the choice was made.
+       * Ticking something means "sync exactly this"; ticking nothing means
+       * "mirror this directory", which is what the job did before any of this
+       * existed. All of it is recorded together so the halves cannot disagree:
+       * the cloud directory is always the one being looked at when the choice
+       * was made.
        */
       function applyPicker() {
         if (!state.picker || !state.editing) return
@@ -2096,16 +2177,18 @@
           return
         }
 
-        const chosen = [...state.picker.chosen]
+        const chosen = [...state.picker.chosen.keys()]
         if (chosen.length === 0) {
           state.editing.remotePath = state.picker.path
           state.editing.includeFiles = []
+          state.editing.includeDirs = []
         } else {
           // The job's directory has to contain everything ticked, or the server
           // rejects the job. The deepest shared ancestor is the only choice that
           // always does and never pulls in more of the tree than it must.
           state.editing.remotePath = commonCloudDir(chosen)
-          state.editing.includeFiles = chosen
+          state.editing.includeFiles = chosen.filter((path) => state.picker.chosen.get(path) === 'file')
+          state.editing.includeDirs = chosen.filter((path) => state.picker.chosen.get(path) === 'dir')
         }
         state.picker = null
         renderOverlay(true)

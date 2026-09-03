@@ -368,9 +368,22 @@ func (e *Engine) Settings() settings.Settings {
 	copy := e.settings
 	copy.Jobs = append([]settings.Job(nil), e.settings.Jobs...)
 	for index := range copy.Jobs {
-		copy.Jobs[index].ExcludeNames = append([]string(nil), copy.Jobs[index].ExcludeNames...)
+		job := &copy.Jobs[index]
+		job.ExcludeNames = cloneStrings(job.ExcludeNames)
+		job.IncludeFiles = cloneStrings(job.IncludeFiles)
+		job.IncludeDirs = cloneStrings(job.IncludeDirs)
 	}
 	return copy
+}
+
+// cloneStrings keeps a caller from writing through a returned job into the
+// scheduler's own configuration. A nil stays nil so a cloned job still compares
+// equal to the one it was cloned from.
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
 }
 
 // ReloadSettings re-reads the stored document and returns it.

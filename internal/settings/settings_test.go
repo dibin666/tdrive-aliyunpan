@@ -2,6 +2,7 @@ package settings
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -254,6 +255,36 @@ func TestNormalizeCleansAndDedupesPickedFiles(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("IncludeFiles = %v, want %v", got, want)
 		}
+	}
+}
+
+// A ticked directory is held to the same rule as a ticked file: it is rebased
+// from the job's cloud directory, so it has to be under it.
+func TestNormalizeCleansPickedDirectories(t *testing.T) {
+	document := Settings{Jobs: []Job{{
+		ID: "j1", DriveName: "backup", RemotePath: "/动画", TargetPath: "/动画",
+		IncludeDirs: []string{"/动画//第一季/", " /动画/第一季 ", "/动画/剧场版", ""},
+	}}}
+	if err := document.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	got := document.Jobs[0].IncludeDirs
+	want := []string{"/动画/第一季", "/动画/剧场版"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("IncludeDirs = %v, want %v", got, want)
+	}
+	if !document.Jobs[0].HasSelection() {
+		t.Fatal("a job with only ticked directories does not report a selection")
+	}
+}
+
+func TestNormalizeRejectsAPickedDirectoryOutsideTheJobDirectory(t *testing.T) {
+	document := Settings{Jobs: []Job{{
+		ID: "j1", DriveName: "backup", RemotePath: "/动画", TargetPath: "/动画",
+		IncludeDirs: []string{"/电影/第一季"},
+	}}}
+	if err := document.Normalize(); err == nil {
+		t.Fatal("a picked directory outside the job's cloud directory was accepted")
 	}
 }
 
