@@ -162,13 +162,13 @@ func measureStageDir(directory string) (int64, int64) {
 // bytes go, and the next attempt downloads them again from scratch.
 func (e *Engine) DeleteStaged(ctx context.Context, ids ...string) (int, error) {
 	if len(ids) == 0 {
-		return 0, errors.New("没有指定要删除的文件")
+		return 0, errors.New("未指定要删除的文件，请选择文件")
 	}
 	wanted := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
 		if id == "" || !safeIDPattern.MatchString(id) {
-			return 0, fmt.Errorf("非法文件 ID: %q", id)
+			return 0, fmt.Errorf("文件 ID %q 不合法，仅支持字母、数字、下划线和短横线", id)
 		}
 		wanted[id] = true
 	}
@@ -249,9 +249,9 @@ func (e *Engine) DeleteStaged(ctx context.Context, ids ...string) (int, error) {
 	}
 	if deleted == 0 {
 		if running > 0 {
-			return 0, errors.New("选中的文件正在传输，请先取消再删除")
+			return 0, errors.New("选中的文件正在传输中，请先取消传输再删除本地文件")
 		}
-		return 0, errors.New("没有可以删除的文件")
+		return 0, errors.New("未找到可删除的本地暂存文件")
 	}
 	return deleted, nil
 }

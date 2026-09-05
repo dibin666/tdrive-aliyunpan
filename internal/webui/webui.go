@@ -39,10 +39,10 @@ func New(engine *syncengine.Engine, host *hostapi.Client) *Server {
 
 // Handle dispatches one request.
 //
-// Every route below /api requires an administrator. tdrive's own middleware
-// only guarantees that the caller is signed in — a plugin route is not
-// automatically an admin route — and everything here changes what the drive
-// stores or reveals the linked cloud account.
+// Every route below /api requires the account that owns this installation.
+// tdrive's own middleware only guarantees that the caller is signed in — a
+// plugin route is not automatically an owner-only route — and everything here
+// changes what the drive stores or reveals the linked cloud account.
 func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (tdriveplugin.HTTPResponse, error) {
 	path := strings.TrimSuffix(request.Path, "/")
 	if path == "" {
@@ -61,7 +61,7 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 		}, nil
 	}
 
-	if err := s.requireAdmin(ctx, request.UserID); err != nil {
+	if err := s.requireCaller(ctx, request.UserID); err != nil {
 		return status(http.StatusForbidden, err.Error()), nil
 	}
 	query, _ := url.ParseQuery(request.RawQuery)
@@ -291,28 +291,42 @@ func (s *Server) Handle(ctx context.Context, request tdriveplugin.HTTPRequest) (
 	return status(http.StatusNotFound, "没有这个接口"), nil
 }
 
-// requireAdmin resolves the caller against the drive's user list.
-func (s *Server) requireAdmin(ctx context.Context, userID string) error {
+// requireCaller resolves the caller against what the host will say about them.
+//
+// Under per-account plugin ownership the installing account is the owner, and
+// tdrive already resolved /plugins/{id} against the caller's own installation
+// before this handler ran — so reaching here is itself proof of ownership, and
+// the only thing left worth checking is that the account is still enabled. The
+// administrator test that used to live here belonged to the era when a plugin
+// was installed once for the whole deployment and every signed-in user shared
+// it.
+//
+// On such an older host users.list still returns everybody, and the caller
+// genuinely might be an unrelated non-administrator, so the role test is kept
+// for exactly that case. Dropping it unconditionally would quietly hand this
+// page to every account on an unupgraded deployment.
+func (s *Server) requireCaller(ctx context.Context, userID string) error {
 	if userID == "" {
-		return fmt.Errorf("需要登录")
+		return fmt.Errorf("未登录，请先登录 tdrive")
 	}
 	users, err := s.host.Users(ctx)
 	if err != nil {
-		return fmt.Errorf("读取用户列表失败: %w", err)
+		return fmt.Errorf("读取用户信息失败: %w", err)
 	}
+	scoped := hostapi.OwnedByCaller(users)
 	for _, user := range users {
 		if user.ID != userID {
 			continue
 		}
 		if !user.Enabled {
-			return fmt.Errorf("账号已停用")
+			return fmt.Errorf("当前账号已被停用")
 		}
-		if user.Role != "admin" {
-			return fmt.Errorf("这个页面需要管理员账号")
+		if !scoped && user.Role != "admin" {
+			return fmt.Errorf("此操作仅对插件所有者或管理员开放")
 		}
 		return nil
 	}
-	return fmt.Errorf("找不到当前账号")
+	return fmt.Errorf("找不到当前账号，请重新登录")
 }
 
 var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -330,7 +344,7 @@ func queueIDs(body []byte, single string) ([]string, error) {
 			IDs []string `json:"ids"`
 		}
 		if err := json.Unmarshal(body, &request); err != nil {
-			return nil, fmt.Errorf("请求不是合法的 JSON: %w", err)
+			return nil, fmt.Errorf("请求格式错误，非有效 JSON: %w", err)
 		}
 		ids := make([]string, 0, len(request.IDs))
 		seen := make(map[string]bool, len(request.IDs))
@@ -340,25 +354,25 @@ func queueIDs(body []byte, single string) ([]string, error) {
 				continue
 			}
 			if !safeIDPattern.MatchString(id) {
-				return nil, fmt.Errorf("队列项 ID 不合法: %q", id)
+				return nil, fmt.Errorf("队列项 ID %q 不合法，仅支持字母、数字、下划线和短横线", id)
 			}
 			seen[id] = true
 			ids = append(ids, id)
 		}
 		if len(ids) == 0 {
-			return nil, fmt.Errorf("没有选中任何队列项")
+			return nil, fmt.Errorf("未选中任何队列项，请勾选后再试")
 		}
 		if len(ids) > maxQueueIDs {
-			return nil, fmt.Errorf("一次最多操作 %d 项", maxQueueIDs)
+			return nil, fmt.Errorf("单次操作超出上限 %d 项，请分批处理", maxQueueIDs)
 		}
 		return ids, nil
 	}
 	single = strings.TrimSpace(single)
 	if single == "" {
-		return nil, fmt.Errorf("没有选中任何队列项")
+		return nil, fmt.Errorf("未选中任何队列项，请指定队列项后再试")
 	}
 	if !safeIDPattern.MatchString(single) {
-		return nil, fmt.Errorf("队列项 ID 不合法: %q", single)
+		return nil, fmt.Errorf("队列项 ID %q 不合法，仅支持字母、数字、下划线和短横线", single)
 	}
 	return []string{single}, nil
 }

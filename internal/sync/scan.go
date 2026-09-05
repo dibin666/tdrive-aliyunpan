@@ -136,7 +136,7 @@ func resolveDriveForScan(kind string, drives []aliyunpan.Drive) (aliyunpan.Drive
 	if kind == aliyunpan.DriveResource {
 		label = "资源库"
 	}
-	return aliyunpan.Drive{}, fmt.Errorf("当前阿里云盘账号没有%s", label)
+	return aliyunpan.Drive{}, fmt.Errorf("当前阿里云盘账号缺少%s，请检查网盘权限", label)
 }
 
 func (e *Engine) scanJob(ctx context.Context, cli *aliyunpan.CLI, job settings.Job, selected ...aliyunpan.Drive) error {
@@ -169,7 +169,7 @@ func compileExcludes(patterns []string) ([]*regexp.Regexp, error) {
 	for _, pattern := range patterns {
 		compiled, err := regexp.Compile(pattern)
 		if err != nil {
-			return nil, fmt.Errorf("排除规则 %q 无效: %w", pattern, err)
+			return nil, fmt.Errorf("排除规则 %q 正则语法无效: %w，请检查规则", pattern, err)
 		}
 		excludes = append(excludes, compiled)
 	}
@@ -203,7 +203,7 @@ func (e *Engine) walkCloudDir(
 		queue = queue[1:]
 		*visited++
 		if *visited > maxScanDirectories {
-			return fmt.Errorf("目录数超过 %d，停止扫描", maxScanDirectories)
+			return fmt.Errorf("单次扫描目录数超出上限 %d，已停止扫描；请拆分任务或设置更深根目录", maxScanDirectories)
 		}
 
 		entries, err := cli.List(ctx, cloudDir, drive.ID)
@@ -215,7 +215,7 @@ func (e *Engine) walkCloudDir(
 			// though it were a directory would create a drive directory named
 			// after the file and put the file inside it, so it is reported as a
 			// selection that is no longer there.
-			return fmt.Errorf("%w: %s 不是目录", aliyunpan.ErrPathNotFound, cloudDir)
+			return fmt.Errorf("%w: 云盘路径 %s 不是目录，无法作为目录扫描", aliyunpan.ErrPathNotFound, cloudDir)
 		}
 		targetDir := mapPath(job.RemotePath, job.TargetPath, cloudDir)
 		existing, err := cache.at(ctx, targetDir)
@@ -276,7 +276,7 @@ func (e *Engine) scanChosen(
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("勾选的内容在云盘上找不到: %s", strings.Join(missing, "、"))
+		return fmt.Errorf("勾选的云端内容不存在或已删除: %s，请重新在任务中选择", strings.Join(missing, "、"))
 	}
 	return nil
 }

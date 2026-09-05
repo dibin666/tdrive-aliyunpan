@@ -7,3 +7,4 @@
 
 # Local agent and debugging scratch space.
 /.cursor/
+/.playwright-mcp/

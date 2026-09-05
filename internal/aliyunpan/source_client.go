@@ -830,11 +830,11 @@ func parseByteRate(raw string) (int64, error) {
 		index++
 	}
 	if index == 0 {
-		return 0, fmt.Errorf("下载限速格式不合法: %q", raw)
+		return 0, fmt.Errorf("下载限速格式错误: %q，示例: 2MB、512KB", raw)
 	}
 	number, err := strconv.ParseFloat(value[:index], 64)
 	if err != nil || number < 0 {
-		return 0, fmt.Errorf("下载限速格式不合法: %q", raw)
+		return 0, fmt.Errorf("下载限速格式错误: %q，示例: 2MB、512KB", raw)
 	}
 	unit := strings.TrimSpace(value[index:])
 	multiplier := float64(1)
@@ -849,11 +849,11 @@ func parseByteRate(raw string) (int64, error) {
 	case "T", "TB", "TIB":
 		multiplier = 1 << 40
 	default:
-		return 0, fmt.Errorf("下载限速单位不支持: %q", raw)
+		return 0, fmt.Errorf("下载限速单位 %q 不支持，支持 KB、MB、GB", raw)
 	}
 	calculated := number * multiplier
 	if calculated > float64(^uint64(0)>>1) {
-		return 0, fmt.Errorf("下载限速超出范围: %q", raw)
+		return 0, fmt.Errorf("下载限速数值 %q 超出支持上限", raw)
 	}
 	return int64(calculated), nil
 }

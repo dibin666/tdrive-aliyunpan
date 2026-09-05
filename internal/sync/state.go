@@ -115,6 +115,12 @@ type ScanView struct {
 // show what the sync is actually bound by without the operator having to open
 // another page.
 type LimitsView struct {
+	// Available says whether the host answered at all. settings.get is
+	// administrator-only, so a plugin owned by an ordinary account never gets
+	// these numbers — and a page that rendered the zero value would show a
+	// column of "0 B" that reads as a broken drive rather than as a setting
+	// this account is not allowed to see.
+	Available           bool  `json:"available"`
 	SegmentSize         int64 `json:"segmentSize"`
 	UploadPartSize      int64 `json:"uploadPartSize"`
 	UploadThreads       int   `json:"uploadThreads"`
@@ -244,6 +250,7 @@ func (e *Engine) State(ctx context.Context) Snapshot {
 		Schedule: schedule,
 		Scan:     ScanView{Scanning: scanning, Error: scanError},
 		Limits: LimitsView{
+			Available:           limitsErr == nil,
 			SegmentSize:         limits.SegmentSize,
 			UploadPartSize:      limits.UploadPartSize,
 			UploadThreads:       limits.UploadThreads,
@@ -314,9 +321,9 @@ func describeStatus(snapshot Snapshot, current settings.Settings, now time.Time)
 	case snapshot.Paused:
 		return "已暂停"
 	case !snapshot.Account.LoggedIn:
-		return "阿里云盘未登录，请到「账号」页扫码登录"
+		return "阿里云盘未登录，前往「账号」页扫码登录"
 	case len(current.Jobs) == 0:
-		return "还没有同步任务，请到「任务」页新建"
+		return "暂无同步任务，前往「任务」页新建任务"
 	case !current.Schedule.Enabled:
 		return "计划任务已关闭"
 	case snapshot.Summary.Active > 0:

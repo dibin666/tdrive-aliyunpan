@@ -638,31 +638,47 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return withTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }
 
-// uploadOwner resolves the account uploads are attributed to. The owner
-// decides whose quota is consumed and who sees the file, so falling back to
-// the first administrator keeps a fresh installation working without asking a
-// question the operator has no context for yet.
+// uploadOwner resolves the account uploads are attributed to. The owner decides
+// whose quota is consumed and who sees the file.
+//
+// The default is the account that installed this plugin, which is both the
+// obvious answer and the only one available: a per-account host tells a plugin
+// about its owner and nobody else. The older fallback — the first
+// administrator — is kept for hosts that still list every account, where it
+// remains the only sensible guess.
+//
+// Nothing here requires the owner to be an administrator. Under per-account
+// ownership a plugin can perfectly well belong to an ordinary account, and
+// demanding a role that the host may never report would leave that
+// installation unable to upload a single file.
 func (e *Engine) uploadOwner(ctx context.Context) (string, error) {
 	configured := e.Settings().OwnerUserID
 	users, err := e.host.Users(ctx)
 	if err != nil {
-		return "", fmt.Errorf("读取用户列表: %w", err)
+		return "", fmt.Errorf("读取账号信息: %w", err)
 	}
 	if configured != "" {
 		for _, user := range users {
 			if user.ID == configured {
 				if !user.Enabled {
-					return "", fmt.Errorf("上传归属账号 %s 已被停用", user.Username)
+					return "", fmt.Errorf("指定的上传归属账号 %s 已停用，请启用账号或重新指定", user.Username)
 				}
 				return user.ID, nil
 			}
 		}
-		return "", errors.New("配置里的上传归属账号不存在")
+		return "", errors.New("配置的上传归属账号不存在，或该账号不是当前插件的所有者；请检查设置")
+	}
+	if hostapi.OwnedByCaller(users) {
+		owner := users[0]
+		if !owner.Enabled {
+			return "", fmt.Errorf("插件所有者账号 %s 已停用，请先在 tdrive 启用该账号", owner.Username)
+		}
+		return owner.ID, nil
 	}
 	for _, user := range users {
 		if user.Role == "admin" && user.Enabled {
 			return user.ID, nil
 		}
 	}
-	return "", errors.New("找不到可用的管理员账号")
+	return "", errors.New("未找到可用的上传归属账号，请检查账号状态")
 }

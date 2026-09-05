@@ -718,7 +718,7 @@
           state.lastLoad = Date.now()
           render()
         } catch (error) {
-          document.getElementById('status').textContent = '读取状态失败：' + error.message
+          document.getElementById('status').textContent = '读取状态失败: ' + error.message
         } finally {
           state.loading = false
         }
@@ -837,10 +837,10 @@
               '</div>'
             : '',
           quota.oversize
-            ? '<div class="warn-box" style="margin-top:.75rem">队列里有单个文件大于一整天的配额。这样的文件会在配额尚未使用的日子里单独放行，否则它会永远排不上队。</div>'
+            ? '<div class="warn-box" style="margin-top:.75rem">队列中存在大于单日配额的文件。该文件会在配额未消耗的日期单独放行。</div>'
             : '',
           snapshot.scan.error
-            ? '<div class="error-box" style="margin-top:.75rem">扫描出错：' +
+            ? '<div class="error-box" style="margin-top:.75rem">扫描出错: ' +
               esc(snapshot.scan.error) +
               '</div>'
             : '',
@@ -883,7 +883,7 @@
 
           '<div class="card" style="padding:0">',
           rows.length === 0
-            ? '<div class="empty">没有符合条件的传输</div>'
+            ? '<div class="empty">暂无传输记录</div>'
             : selectionBar(rows) +
               '<div class="rows" data-density="' +
                 state.density +
@@ -891,9 +891,9 @@
                 rows.map((row) => transferRow(row, now, snapshot.now || now)).join('') +
                 '</div>',
           '</div>',
-          '<div class="hint">暂存目录 ' +
+          '<div class="hint">暂存目录: ' +
             esc(snapshot.stageDir) +
-            '，上限 ' +
+            '，上限: ' +
             (snapshot.limits.stageLimit > 0 ? esc(bytes(snapshot.limits.stageLimit)) : '不限') +
             '。</div>',
         ].join('')
@@ -1080,7 +1080,7 @@
        */
       function downloadsView(snapshot) {
         const view = state.downloads
-        if (!view) return '<div class="card"><div class="empty">正在读取暂存目录…</div></div>'
+        if (!view) return '<div class="card"><div class="empty">读取暂存目录…</div></div>'
         const files = view.files || []
         const chosen = files.filter((file) => state.stagedSelected.has(file.itemId))
         const usedPercent =
@@ -1104,9 +1104,9 @@
               (usedPercent >= 90 ? 'var(--color-rust, #c0563b)' : 'var(--color-clay)') +
               '"></div></div>'
             : '',
-          '<div class="hint">暂存目录 ' + esc(view.stageDir) + '。</div>',
+          '<div class="hint">暂存目录: ' + esc(view.stageDir) + '</div>',
           usedPercent >= 90
-            ? '<div class="warn-box" style="margin-top:.75rem">暂存目录快满了。新的下载会一直等到腾出空间为止，先删掉这里不需要的文件。</div>'
+            ? '<div class="warn-box" style="margin-top:.75rem">暂存空间不足 10%。新下载需等待空间释放，请删除不需要的暂存文件。</div>'
             : '',
           '</div>',
 
@@ -1114,15 +1114,15 @@
           '<p class="section-title" style="margin:0">暂存文件</p>',
           '<span class="grow"></span>',
           view.orphanCount > 0
-            ? '<button class="btn btn-ghost" id="prune-staged" type="button">清理无主文件（' +
+            ? '<button class="btn btn-ghost" id="prune-staged" type="button">清理无主文件 (' +
               view.orphanCount +
-              '）</button>'
+              ')</button>'
             : '',
           '</div>',
 
           '<div class="card" style="padding:0">',
           files.length === 0
-            ? '<div class="empty">暂存目录是空的。上传成功后本地文件会按设置删除，失败的会留在这里等你处理。</div>'
+            ? '<div class="empty">暂存目录为空。上传成功后本地暂存自动删除；失败文件保留在此。</div>'
             : stagedSelectionBar(files, chosen) +
               '<div class="rows" data-density="' +
                 state.density +
@@ -1130,7 +1130,7 @@
                 files.map((file) => stagedRow(file)).join('') +
                 '</div>',
           '</div>',
-          '<div class="hint">「占用空间」是文件真正吃掉的磁盘：未下完的文件一开始就按最终大小占位，所以它通常大于「已下载」。删除只动本地文件，队列记录和 tdrive 里已经传好的内容都不受影响。</div>',
+          '<div class="hint">「占用空间」为实际占用磁盘：未下载完的文件会按完整大小预分配，通常大于「已下载」。删除仅清理本地暂存，不影响队列记录与 tdrive 已上传文件。</div>',
         ].join('')
       }
 
@@ -1163,7 +1163,7 @@
         const label = file.orphan
           ? '无主文件'
           : file.complete && file.state !== 'complete'
-            ? '已下完，等待上传'
+            ? '下载完成，等待上传'
             : STATUS_LABEL[file.state] || '未知'
 
         return [
@@ -1212,7 +1212,7 @@
               detail('本地路径', file.path) +
               detail('磁盘占用', bytes(file.diskBytes)) +
               detail('已下载', file.size > 0 ? bytes(file.downloaded) + ' / ' + bytes(file.size) : bytes(file.downloaded)) +
-              detail('队列状态', file.orphan ? '队列里已经没有这条记录' : STATUS_LABEL[file.state] || '未知') +
+              detail('队列状态', file.orphan ? '队列无此记录' : STATUS_LABEL[file.state] || '未知') +
               detail('尝试次数', String(file.attempts || 0)) +
               detail('最后修改', clock(file.modifiedAt)) +
               (file.error ? detail('错误', file.error) : '') +
@@ -1240,7 +1240,7 @@
           '<div class="toolbar"><p class="section-title" style="margin:0">同步任务</p><span class="grow"></span>',
           '<button class="btn btn-primary" id="new-job" type="button">新建任务</button></div>',
           jobs.length === 0
-            ? '<div class="empty">还没有任务。新建一个，指定要同步的云盘目录和 tdrive 里的落点。</div>'
+            ? '<div class="empty">暂无同步任务。点击新建任务，指定云盘目录与 tdrive 目标目录。</div>'
             : jobs
                 .map(
                   (job) =>
@@ -1280,15 +1280,15 @@
           '<div><label class="switch"><input type="checkbox" id="schedule-enabled"' +
             (schedule.enabled ? ' checked' : '') +
             '> 启用计划任务</label>',
-          '<div class="hint">关闭后不会开始任何新的传输。</div></div>',
-          field('窗口开始', '<input class="input" id="window-start" placeholder="01:00" value="' + esc(schedule.windowStart) + '">', '留空表示全天可跑'),
-          field('窗口结束', '<input class="input" id="window-end" placeholder="07:00" value="' + esc(schedule.windowEnd) + '">', '结束早于开始表示跨零点'),
-          field('扫描间隔（分钟）', '<input class="input" id="interval" type="number" min="1" max="1440" value="' + schedule.intervalMinutes + '">', '窗口内每隔这么久重新扫描一次云盘'),
+          '<div class="hint">关闭后不启动新传输。</div></div>',
+          field('窗口开始', '<input class="input" id="window-start" placeholder="01:00" value="' + esc(schedule.windowStart) + '">', '留空表示全天运行'),
+          field('窗口结束', '<input class="input" id="window-end" placeholder="07:00" value="' + esc(schedule.windowEnd) + '">', '结束时间早于开始时间表示跨日'),
+          field('扫描间隔（分钟）', '<input class="input" id="interval" type="number" min="1" max="1440" value="' + schedule.intervalMinutes + '">', '窗口内重新扫描云盘的间隔时间'),
           '</div>',
           '<div class="hint" style="margin-top:.5rem">当前' +
-            (schedule.open ? '在窗口内' : '不在窗口内') +
+            (schedule.open ? '处于同步窗口内' : '不在同步窗口内') +
             (schedule.nextOpenAt ? '，下次开启 ' + esc(clock(schedule.nextOpenAt)) : '') +
-            '。上次扫描 ' +
+            '；上次扫描 ' +
             esc(clock(snapshot.scan.lastScanAt)) +
             '。</div>',
           '</div>',
@@ -1296,14 +1296,14 @@
           '<div class="card">',
           '<p class="section-title">每日配额</p>',
           '<div class="form">',
-          field('每日上传上限（GiB）', '<input class="input" id="quota-gib" type="number" min="0" step="0.5" value="' + (quota.dailyBytes > 0 ? (quota.dailyBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示不限。只统计推送到 Telegram 的字节。'),
-          field('配额重置时刻', '<input class="input" id="quota-reset" placeholder="00:00" value="' + esc(currentResetAt()) + '">', '每天到点归零'),
+          field('每日上传上限（GiB）', '<input class="input" id="quota-gib" type="number" min="0" step="0.5" value="' + (quota.dailyBytes > 0 ? (quota.dailyBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示不限额，仅统计推送到 Telegram 的流量'),
+          field('配额重置时刻', '<input class="input" id="quota-reset" placeholder="00:00" value="' + esc(currentResetAt()) + '">', '每日到达该时刻重置配额'),
           '</div>',
-          '<div class="hint" style="margin-top:.5rem">当前周期 ' +
+          '<div class="hint" style="margin-top:.5rem">当前统计周期 ' +
             esc(quota.day) +
             '，已用 ' +
             esc(bytes(quota.usedBytes)) +
-            '，' +
+            '，于 ' +
             esc(clock(quota.resetAt)) +
             ' 重置。</div>',
           '</div>',
@@ -1311,43 +1311,51 @@
           '<div class="card">',
           '<p class="section-title">暂存与归属</p>',
           '<div class="form">',
-          field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage'),
-          field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 的暂存上限'),
-          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '源码客户端的总下载限速，留空表示不限速'),
-          field('阿里云盘同时下载文件数', '<input class="input" id="aliyunpan-download-concurrency" type="number" min="1" max="32" step="1" value="' + ((state.settings && state.settings.downloadConcurrency) || 2) + '">', '限制同时从阿里云盘下载到本地的文件数，不影响 tdrive 自身的 Telegram 下载'),
-          field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空使用第一个管理员" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归谁、占谁的配额'),
+          field('暂存目录', '<input class="input" id="stage-dir" placeholder="' + esc(snapshot.stageDir) + '" value="' + esc((state.settings && state.settings.stageDir) || '') + '">', '留空使用插件数据目录下的 stage 目录'),
+          field('暂存上限（GiB）', '<input class="input" id="stage-limit" type="number" min="0" step="0.5" value="' + ((state.settings && state.settings.stageLimitBytes > 0) ? (state.settings.stageLimitBytes / 1073741824).toFixed(2) : 0) + '">', '0 表示跟随 tdrive 暂存上限'),
+          field('云盘下载限速', '<input class="input" id="download-rate" placeholder="例如 2MB" value="' + esc((state.settings && state.settings.downloadRate) || '') + '">', '源码客户端总下载限速，留空表示不限速'),
+          field('阿里云盘同时下载文件数', '<input class="input" id="aliyunpan-download-concurrency" type="number" min="1" max="32" step="1" value="' + ((state.settings && state.settings.downloadConcurrency) || 2) + '">', '同时从阿里云盘下载的文件数，不影响 tdrive 本身的 Telegram 下载'),
+          field('上传归属账号 ID', '<input class="input" id="owner" placeholder="留空归属安装这个插件的账号" value="' + esc((state.settings && state.settings.ownerUserId) || '') + '">', '决定文件归属账号与占用配额'),
           '<div><label class="switch"><input type="checkbox" id="delete-local-after-upload"' +
             (!state.settings || state.settings.deleteLocalAfterUpload !== false ? ' checked' : '') +
-            '> 上传完成后立刻删除本地暂存文件</label>' +
-            '<div class="hint">只有上传成功才会删除。上传失败的文件一律保留，可以在「下载文件」页查看和清理。</div></div>',
+            '> 上传完成后删除本地暂存文件</label>' +
+            '<div class="hint">上传成功后自动删除；上传失败则保留，可在「下载文件」页查看和清理。</div></div>',
           '</div>',
           '</div>',
 
           '<div class="card">',
           '<p class="section-title">失败重试</p>',
           '<div class="form">',
-          field('最多尝试次数', '<input class="input" id="retry-attempts" type="number" min="1" max="100" step="1" value="' + retrySetting('maxAttempts', 5) + '">', '包含第一次尝试，填 1 表示不自动重试'),
-          field('首次重试间隔（秒）', '<input class="input" id="retry-initial" type="number" min="1" max="86400" step="1" value="' + retrySetting('initialSeconds', 30) + '">', '之后每次翻倍'),
-          field('最大重试间隔（秒）', '<input class="input" id="retry-max" type="number" min="1" max="86400" step="1" value="' + retrySetting('maxSeconds', 1800) + '">', '退避时间的上限'),
+          field('最多尝试次数', '<input class="input" id="retry-attempts" type="number" min="1" max="100" step="1" value="' + retrySetting('maxAttempts', 5) + '">', '包含初始尝试，填 1 表示不自动重试'),
+          field('首次重试间隔（秒）', '<input class="input" id="retry-initial" type="number" min="1" max="86400" step="1" value="' + retrySetting('initialSeconds', 30) + '">', '后续每次重试间隔翻倍'),
+          field('最大重试间隔（秒）', '<input class="input" id="retry-max" type="number" min="1" max="86400" step="1" value="' + retrySetting('maxSeconds', 1800) + '">', '退避重试的最大等待时间'),
           '</div>',
-          '<div class="hint" style="margin-top:.5rem">下载和上传失败都会自动重试，已经下好的部分会保留下来续传，不会从头再来。次数用完才会记成「失败」，本地文件依然保留。重试的唤醒跟着 30 秒一次的调度走，所以实际等待会比设定值多最多 30 秒。</div>',
+          '<div class="hint" style="margin-top:.5rem">下载与上传失败均自动重试，保留已下载分片支持断点续传。耗尽尝试次数后标记为「失败」并保留本地暂存。调度轮询周期为 30 秒，实际重试时间有最多 30 秒偏差。</div>',
           '</div>',
 
           '<div class="toolbar"><span class="grow"></span><button class="btn btn-primary" id="save-plan" type="button">保存</button></div>',
 
           '<div class="card">',
           '<p class="section-title">tdrive 当前传输限制（同步会遵循这些参数）</p>',
-          '<div class="stats">',
-          stat('存储分片', bytes(limits.segmentSize)),
-          stat('上传分片', bytes(limits.uploadPartSize)),
-          stat('上传线程', String(limits.uploadThreads)),
-          stat('同时上传文件', String(limits.uploadConcurrency)),
-          stat('tdrive 同时下载文件', String(limits.downloadConcurrency)),
-          stat('单文件下载连接', String(limits.maxDownloadConns)),
-          stat('调用间隔', limits.rateLimitMillis > 0 ? limits.rateLimitMillis + ' ms' : '不限'),
-          stat('tdrive 暂存上限', limits.cacheLimit > 0 ? bytes(limits.cacheLimit) : '不限'),
-          '</div>',
-          '<div class="hint" style="margin-top:.5rem">上面的“阿里云盘同时下载文件数”是插件自己的源下载限制；这里的 tdrive 参数请到「设置 → 性能参数 / 存储与暂存」修改。</div>',
+          // A column of zeroes reads as a broken drive. When tdrive declines to
+          // report its settings — they are administrator-only, and this plugin
+          // may belong to an ordinary account — say that instead of rendering
+          // the zero value.
+          limits.available === false
+            ? '<div class="hint">tdrive 运行参数仅向管理员开放。当前插件所有者非管理员，无法读取该参数。同步仍按 tdrive 实际配置执行。</div>'
+            : [
+                '<div class="stats">',
+                stat('存储分片', bytes(limits.segmentSize)),
+                stat('上传分片', bytes(limits.uploadPartSize)),
+                stat('上传线程', String(limits.uploadThreads)),
+                stat('同时上传文件', String(limits.uploadConcurrency)),
+                stat('tdrive 同时下载文件', String(limits.downloadConcurrency)),
+                stat('单文件下载连接', String(limits.maxDownloadConns)),
+                stat('调用间隔', limits.rateLimitMillis > 0 ? limits.rateLimitMillis + ' ms' : '不限'),
+                stat('tdrive 暂存上限', limits.cacheLimit > 0 ? bytes(limits.cacheLimit) : '不限'),
+                '</div>',
+                '<div class="hint" style="margin-top:.5rem">「阿里云盘同时下载文件数」为插件下载并发；tdrive 参数在「设置 → 性能参数 / 存储与暂存」中配置。</div>',
+              ].join(''),
           '</div>',
         ].join('')
       }
@@ -1412,8 +1420,8 @@
       function loginPanel(login) {
         if (login && login.active && login.url) {
           return [
-            '<div class="hint">在浏览器里打开下面的链接完成授权和扫码，然后回到这里点「我已完成登录」。链接 5 分钟内有效',
-            login.expiresAt ? '（' + esc(clock(new Date(login.expiresAt).getTime())) + ' 失效）' : '',
+            '<div class="hint">在浏览器中打开链接完成扫码授权，完成后点击「我已完成登录」。链接 5 分钟内有效',
+            login.expiresAt ? '（' + esc(clock(new Date(login.expiresAt).getTime())) + ' 过期）' : '',
             '。</div>',
             '<div class="mono" style="margin:.5rem 0;padding:.5rem;background:var(--sunk);border-radius:var(--radius-control)">' +
               esc(login.url) +
@@ -1426,14 +1434,14 @@
             '<button class="btn btn-primary" id="confirm-login" type="button"' +
               (login.phase === 'finishing' ? ' disabled' : '') +
               '>' +
-              (login.phase === 'finishing' ? '正在换取令牌…' : '我已完成登录') +
+              (login.phase === 'finishing' ? '正在获取 token…' : '我已完成登录') +
               '</button>',
             '</div>',
           ].join('')
         }
         return [
           login && login.error ? '<div class="error-box" style="margin-bottom:.5rem">' + esc(login.error) + '</div>' : '',
-          '<div class="hint">还没有绑定阿里云盘账号。</div>',
+          '<div class="hint">未绑定阿里云盘账号。</div>',
           '<div class="toolbar" style="margin-top:.75rem"><button class="btn btn-primary" id="start-login" type="button">扫码登录</button></div>',
         ].join('')
       }
@@ -1486,7 +1494,7 @@
           field(
             '云盘',
             '<select class="input" id="job-drive">' + driveOptions(job.driveName || 'backup') + '</select>',
-            '每个任务独立选择备份盘或资源库，不依赖 aliyunpan 当前工作盘',
+            '按任务选择备份盘或资源库',
           ),
           '<div class="field-wide">' +
             '<label class="label">云盘目录</label>' +
@@ -1504,16 +1512,16 @@
             field(
               '排除规则',
               '<input class="input" id="job-exclude" value="' + esc((job.excludeNames || []).join(', ')) + '">',
-              '按名称匹配的正则，多个用逗号分隔；匹配到的目录不会被进入',
+              '按名称匹配的正则表达式，英文逗号分隔；命中目录跳过遍历',
             ) +
             '</div>',
           '<div><label class="switch"><input type="checkbox" id="job-overwrite"' +
             (job.overwrite ? ' checked' : '') +
-            '> 大小不同时覆盖 tdrive 里已有的同名文件</label></div>',
+            '> 文件大小不一致时覆盖 tdrive 同名文件</label></div>',
           '<div><label class="switch"><input type="checkbox" id="job-delete"' +
             (job.deleteAfterUpload ? ' checked' : '') +
             '> <span class="danger-text">上传成功后删除云端原文件</span></label>',
-          '<div class="hint">只有在 tdrive 确认写入之后才会删除。这一步不可撤销。</div></div>',
+          '<div class="hint">tdrive 确认写入后删除云端文件。删除不可撤销。</div></div>',
           '</div>',
           '<div class="modal-actions">',
           '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
@@ -1533,7 +1541,7 @@
         const files = job.includeFiles || []
         const picked = [...dirs.map((path) => path + '/'), ...files]
         if (picked.length === 0) {
-          return '<div class="hint">同步整个目录（含子目录）。用「浏览」勾选目录或文件可以只同步其中几项。</div>'
+          return '<div class="hint">同步整个目录（含子目录）。使用「浏览」可勾选指定文件或目录。</div>'
         }
         const counts = [
           dirs.length > 0 ? dirs.length + ' 个目录' : '',
@@ -1543,13 +1551,13 @@
         return (
           '<div class="warn-box" style="margin-top:.5rem">' +
           '<div class="toolbar"><span>只同步勾选的 ' + counts + '</span><span class="grow"></span>' +
-          '<button class="btn btn-ghost" id="job-clear-files" type="button" style="padding:.125rem .375rem;font-size:.75rem">改为整个目录</button></div>' +
+          '<button class="btn btn-ghost" id="job-clear-files" type="button" style="padding:.125rem .375rem;font-size:.75rem">改为整目录同步</button></div>' +
           '<div class="mono" style="margin-top:.375rem;color:inherit">' +
           preview +
           (picked.length > 6 ? '<div>…还有 ' + (picked.length - 6) + ' 项</div>' : '') +
           '</div>' +
           (dirs.length > 0
-            ? '<div class="hint" style="margin:.375rem 0 0">勾选的目录会连同子目录一起同步，目录结构原样保留到目标目录下。</div>'
+            ? '<div class="hint" style="margin:.375rem 0 0">勾选的目录会递归同步子目录，保留原始层级结构。</div>'
             : '') +
           '</div>'
         )
@@ -1598,10 +1606,10 @@
 
         return [
           '<div class="modal-backdrop" data-close-modal="1"><div class="modal">',
-          '<h2>' + (remote ? '选择' + driveLabel(picker.driveName) + '目录或文件' : '选择 tdrive 目录') + '</h2>',
+          '<h2>' + (remote ? '选择 ' + driveLabel(picker.driveName) + ' 目录或文件' : '选择 tdrive 目标目录') + '</h2>',
           '<div class="mono" style="margin-bottom:.5rem">' + esc(picker.path) + '</div>',
           remote
-            ? '<div class="hint" style="margin:-.25rem 0 .5rem">不勾选任何内容就同步整个目录；勾选目录会连同它的子目录一起同步，勾选可以跨目录保留。</div>'
+            ? '<div class="hint" style="margin:-.25rem 0 .5rem">未勾选时默认同步整个目录；勾选目录会连同子目录同步，切换目录保留勾选。</div>'
             : '',
           picker.error ? '<div class="error-box">' + esc(picker.error) + '</div>' : '',
           remote && here.length > 0 && !picker.loading
@@ -1622,7 +1630,7 @@
           picker.loading
             ? '<button type="button" disabled>加载中…</button>'
             : entries.map(row).join('') ||
-              '<button type="button" disabled>' + (remote ? '这个目录是空的' : '这里没有子目录') + '</button>',
+              '<button type="button" disabled>' + (remote ? '目录为空' : '无子目录') + '</button>',
           '</div>',
           '<div class="modal-actions">',
           chosen > 0
@@ -1630,7 +1638,7 @@
             : '',
           '<button class="btn btn-outline" data-close-modal="1" type="button">取消</button>',
           '<button class="btn btn-primary" id="picker-choose" type="button">' +
-            (chosen > 0 ? '使用勾选的 ' + chosen + ' 项' : '选择当前目录') +
+            (chosen > 0 ? '选用已勾选的 ' + chosen + ' 项' : '选择当前目录') +
             '</button>',
           '</div>',
           '</div></div>',
@@ -1676,8 +1684,8 @@
           const name = (file && (file.name || file.itemId)) || target.dataset.deleteStaged
           const warning =
             file && file.complete && file.state !== 'complete'
-              ? '「' + name + '」已经下载完成，只差上传。删掉本地文件意味着重试时要从阿里云盘重新下一遍。确定删除吗？'
-              : '删除「' + name + '」的本地文件？队列记录会保留，重试会重新下载。'
+              ? '「' + name + '」已下载完成，尚未上传。删除本地文件后重试将重新下载。确认删除？'
+              : '删除「' + name + '」的本地暂存文件？队列记录仍保留，重试时重新下载。'
           if (!window.confirm(warning)) return
           await deleteStaged([target.dataset.deleteStaged], '本地文件已删除')
           return
@@ -1750,7 +1758,7 @@
         }
         if (target.dataset.deleteJob) {
           const job = (state.snapshot.jobs || []).find((item) => item.id === target.dataset.deleteJob)
-          if (!window.confirm('删除任务「' + (job ? job.name : '') + '」？已完成的文件会留在 tdrive 里。')) return
+          if (!window.confirm('删除同步任务「' + (job ? job.name : '') + '」？tdrive 中已上传的文件不受影响。')) return
           try {
             await call('/jobs?id=' + encodeURIComponent(target.dataset.deleteJob), { method: 'DELETE' })
             toast('任务已删除')
@@ -1806,14 +1814,13 @@
               (file) => state.stagedSelected.has(file.itemId) && !file.running,
             )
             if (removable.length === 0) {
-              toast('选中的文件都在传输中，请先取消', 'error')
+              toast('选中的文件均在传输中，请先取消传输', 'error')
               return
             }
             const total = removable.reduce((sum, file) => sum + file.diskBytes, 0)
             if (
               !window.confirm(
-                '删除 ' + removable.length + ' 个本地文件，释放 ' + bytes(total) +
-                  '？队列记录会保留，重试会重新下载。',
+                '删除 ' + removable.length + ' 个本地暂存文件（释放 ' + bytes(total) + '）？队列记录仍保留，重试时重新下载。',
               )
             ) {
               return
@@ -1822,7 +1829,7 @@
             return
           }
           case 'prune-staged':
-            if (!window.confirm('删除队列里已经没有对应记录的暂存文件？这些文件不属于任何一条传输。')) return
+            if (!window.confirm('清理所有无主暂存文件？这些文件在当前队列中无对应记录。')) return
             try {
               const result = await call('/downloads/prune', { method: 'POST' })
               toast('已清理 ' + result.count + ' 项，释放 ' + bytes(result.bytes))
@@ -1844,7 +1851,7 @@
             if (
               running > 0 &&
               !window.confirm(
-                '其中 ' + running + ' 个文件正在传输，取消会中断它们并删除 tdrive 里已写入的部分。继续吗？',
+                '其中 ' + running + ' 个文件正在传输中，取消将中断传输并清理 tdrive 未完成分片。确认取消？',
               )
             ) {
               return
@@ -1854,7 +1861,7 @@
           }
           case 'bulk-delete': {
             const removable = selectedRows().filter((row) => FINISHED_STATES.has(row.state))
-            if (!window.confirm('删除选中的 ' + removable.length + ' 条记录？文件本身留在 tdrive 里。')) return
+            if (!window.confirm('删除选中的 ' + removable.length + ' 条历史记录？tdrive 中的文件不受影响。')) return
             await bulkQueue('/queue/delete', (row) => FINISHED_STATES.has(row.state), '记录已删除')
             return
           }
@@ -1908,11 +1915,11 @@
               await navigator.clipboard.writeText(state.snapshot.login.url)
               toast('链接已复制')
             } catch (error) {
-              toast('复制失败，请手动选中链接', 'error')
+              toast('复制失败，请手动复制链接', 'error')
             }
             return
           case 'logout-btn':
-            if (!window.confirm('退出阿里云盘账号？同步会停止，直到重新登录。')) return
+            if (!window.confirm('退出阿里云盘账号？同步任务将暂停，直到重新登录。')) return
             await act('/logout', null, '已退出')
             return
           case 'refresh-account':
@@ -1971,7 +1978,7 @@
       async function bulkQueue(endpoint, applies, message) {
         const ids = selectedRows().filter(applies).map((row) => row.id)
         if (ids.length === 0) {
-          toast('选中的项目都不适用这个操作', 'error')
+          toast('所选项目均不支持此操作', 'error')
           return
         }
         try {
@@ -2043,7 +2050,7 @@
       async function saveJob() {
         captureJobForm()
         const job = state.editing
-        if (job.deleteAfterUpload && !window.confirm('这个任务会在文件成功写入 tdrive 之后删除阿里云盘上的原文件。删除不可撤销，确定要开启吗？')) {
+        if (job.deleteAfterUpload && !window.confirm('开启后，文件成功写入 tdrive 将删除阿里云盘原文件。删除不可撤销，确认开启？')) {
           return
         }
         try {

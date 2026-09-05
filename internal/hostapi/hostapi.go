@@ -57,13 +57,29 @@ func (c *Client) Settings(ctx context.Context) (RuntimeSettings, error) {
 	return settings, err
 }
 
-// Users lists accounts, which is how the plugin resolves both its upload owner
-// and whether the caller of an HTTP route is an administrator.
+// Users lists the accounts the host is willing to tell this plugin about.
+//
+// Since tdrive made plugins per-account, that is exactly one account: the one
+// that installed this plugin. Older hosts, where a plugin was a deployment-wide
+// component, return every account instead — see OwnedByCaller.
 func (c *Client) Users(ctx context.Context) ([]tdriveplugin.User, error) {
 	var users []tdriveplugin.User
 	err := c.host.Call(ctx, "users.list", struct{}{}, &users)
 	return users, err
 }
+
+// OwnedByCaller reports whether the host scopes this plugin to one account.
+//
+// A host that owns plugins per account answers users.list with the single
+// owning account; one from before that change answers with the whole user
+// table. The count is therefore the version signal, and it needs no version
+// string — which matters because minTdriveVersion is documentation that
+// nothing enforces.
+//
+// A single-account deployment on an old host looks identical, and that is
+// harmless: the only account there is the administrator, so both branches
+// reach the same verdict.
+func OwnedByCaller(users []tdriveplugin.User) bool { return len(users) == 1 }
 
 // List reads one drive directory.
 func (c *Client) List(ctx context.Context, path string) ([]tdriveplugin.Entry, error) {

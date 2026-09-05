@@ -801,13 +801,13 @@ func (c *CLI) downloadRange(
 			strings.Contains(lowerBody, "signaturedoesnotmatch") {
 			return fmt.Errorf("%w: HTTP %d", errDownloadURLExpired, response.StatusCode)
 		}
-		return fmt.Errorf("下载分片返回 HTTP %d", response.StatusCode)
+		return fmt.Errorf("下载分片失败，HTTP 状态码 %d", response.StatusCode)
 	}
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("下载分片返回意外的 HTTP 状态: %d", response.StatusCode)
+		return fmt.Errorf("下载分片返回意外的 HTTP 状态码: %d", response.StatusCode)
 	}
 	if response.StatusCode == http.StatusOK && begin != 0 {
-		return errors.New("下载服务器忽略了 Range 请求")
+		return errors.New("下载服务器忽略了 Range 分片请求，返回全文")
 	}
 	if response.StatusCode == http.StatusPartialContent {
 		if err := validateContentRange(response.Header.Get("Content-Range"), begin, end, totalSize); err != nil {
@@ -859,22 +859,22 @@ func (c *CLI) downloadRange(
 func validateContentRange(value string, expectedBegin, expectedEnd, expectedTotal int64) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return errors.New("下载服务器返回 206 但缺少 Content-Range 响应头")
+		return errors.New("下载服务器返回 HTTP 206 但缺少 Content-Range 响应头")
 	}
 	var begin, end int64
 	var total string
 	if _, err := fmt.Sscanf(value, "bytes %d-%d/%s", &begin, &end, &total); err != nil {
-		return fmt.Errorf("下载分片的 Content-Range 不合法: %q", value)
+		return fmt.Errorf("下载分片 Content-Range 响应头格式错误: %q", value)
 	}
 	if begin != expectedBegin || end != expectedEnd-1 {
-		return fmt.Errorf("下载分片范围是 bytes %d-%d，期望 bytes %d-%d", begin, end, expectedBegin, expectedEnd-1)
+		return fmt.Errorf("下载分片范围不匹配: 收到 bytes %d-%d，期望 bytes %d-%d", begin, end, expectedBegin, expectedEnd-1)
 	}
 	reported, err := strconv.ParseInt(total, 10, 64)
 	if err != nil {
-		return fmt.Errorf("下载分片的 Content-Range 文件总大小不合法: %q", total)
+		return fmt.Errorf("下载分片 Content-Range 文件总大小格式错误: %q", total)
 	}
 	if expectedTotal > 0 && reported != expectedTotal {
-		return fmt.Errorf("%w: 下载分片报告的文件大小是 %d，期望 %d", ErrSourceChanged, reported, expectedTotal)
+		return fmt.Errorf("%w: 云端文件大小变化，分片报告 %d 字节，队列记录 %d 字节", ErrSourceChanged, reported, expectedTotal)
 	}
 	return nil
 }
@@ -882,23 +882,23 @@ func validateContentRange(value string, expectedBegin, expectedEnd, expectedTota
 func cleanDownloadPath(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("云盘下载路径不能为空")
+		return "", errors.New("云盘下载路径不能为空，请指定文件路径")
 	}
 	if strings.ContainsRune(raw, 0) {
-		return "", errors.New("云盘下载路径含有 NUL 字符")
+		return "", errors.New("云盘下载路径包含 NUL 字符，请移除特殊字符")
 	}
 	clean := path.Clean("/" + raw)
 	if clean == "/" {
-		return "", errors.New("不能把云盘根目录当作文件下载")
+		return "", errors.New("不能将云盘根目录作为单文件下载")
 	}
 	for _, part := range strings.Split(strings.TrimPrefix(raw, "/"), "/") {
 		if part == ".." {
-			return "", errors.New("云盘下载路径不能含有 .. 路径段")
+			return "", errors.New("云盘下载路径不能包含 .. 路径段")
 		}
 	}
 	for _, part := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
 		if part == "" || part == "." || part == ".." || unsafeWindowsName(part) {
-			return "", fmt.Errorf("云盘下载路径含有不安全的文件名: %q", part)
+			return "", fmt.Errorf("云盘下载路径包含不安全的文件名 %q，请重命名后重试", part)
 		}
 	}
 	return clean, nil

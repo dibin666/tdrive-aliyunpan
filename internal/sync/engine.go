@@ -666,14 +666,21 @@ func (e *Engine) rollQuota(ctx context.Context) {
 // tdrive-upload limits allows. The individual stages have their own gates, so
 // a faster source does not make Telegram uploads exceed the host setting.
 func (e *Engine) dispatch(ctx context.Context) {
+	// A failed read is a reason to fall back, not a reason to stop syncing.
+	// settings.get is administrator-only on the host, so a plugin owned by an
+	// ordinary account never gets an answer — and returning here would leave
+	// that installation unable to transfer a single file. The same fallback
+	// covers an ordinary RPC failure, which used to stall a scan just as hard.
 	limits, err := e.host.Settings(ctx)
 	if err != nil {
-		e.logger.Printf("读取 tdrive 运行参数失败: %v", err)
-		return
+		e.logger.Printf("读取 tdrive 运行参数失败，改用默认并发: %v", err)
 	}
 	uploadWorkers := limits.UploadConcurrency
 	if uploadWorkers < 1 {
-		uploadWorkers = 1
+		// Matches tdrive's own default rather than serialising to one worker,
+		// so an installation that cannot read the setting still transfers at a
+		// sane rate instead of appearing broken.
+		uploadWorkers = settings.DefaultDownloadConcurrency
 	}
 	e.mu.Lock()
 	downloadWorkers := e.settings.DownloadConcurrency
@@ -1167,7 +1174,7 @@ func (e *Engine) flushIfDue(ctx context.Context) {
 // on its very next error.
 func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 	if len(ids) == 0 {
-		return errors.New("没有指定队列项")
+		return errors.New("未指定队列项，请先勾选要重试的项目")
 	}
 	wanted := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -1206,10 +1213,10 @@ func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 	e.mu.Unlock()
 
 	if matched == 0 {
-		return errors.New("找不到这些队列项")
+		return errors.New("队列中未找到指定项目，可能已被清理")
 	}
 	if requeued == 0 {
-		return errors.New("选中的项目都在进行中，无法重试")
+		return errors.New("选中的项目正在传输或已完成，无需重试")
 	}
 	e.persistNow(ctx)
 	e.Wake()
@@ -1227,7 +1234,7 @@ func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 // leaves it alone.
 func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
 	if len(ids) == 0 {
-		return errors.New("没有指定队列项")
+		return errors.New("未指定队列项，请先勾选要取消的项目")
 	}
 	wanted := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -1283,10 +1290,10 @@ func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
 	e.mu.Unlock()
 
 	if matched == 0 {
-		return errors.New("找不到这些队列项")
+		return errors.New("队列中未找到指定项目，可能已被清理")
 	}
 	if cancelled == 0 {
-		return errors.New("选中的项目都已经结束了")
+		return errors.New("选中的项目已全部完成或已取消")
 	}
 
 	// Non-running items have no active transfer goroutine to discard their
@@ -1436,7 +1443,7 @@ func (e *Engine) stageLimit(limits hostapi.RuntimeSettings) int64 {
 
 func (e *Engine) reserveStageRoom(itemID string, size int64, stageDir string, limits hostapi.RuntimeSettings) (func(), error) {
 	if size < 0 {
-		return nil, fmt.Errorf("文件大小不能为负数: %d", size)
+		return nil, fmt.Errorf("文件大小 %d 异常，不能为负数", size)
 	}
 	limit := e.stageLimit(limits)
 	if limit <= 0 {
@@ -1463,7 +1470,7 @@ func (e *Engine) reserveStageRoom(itemID string, size int64, stageDir string, li
 	reserved := e.stageReserved
 	if used+reserved+size > limit && used+reserved > 0 {
 		e.mu.Unlock()
-		return nil, fmt.Errorf("%w：已占用 %d 字节，上限 %d 字节，本文件 %d 字节；等待其它文件完成后重试",
+		return nil, fmt.Errorf("%w：已占用 %d 字节，上限 %d 字节，本文件需要 %d 字节；等待其他传输完成后自动重试",
 			ErrStageRoom, used+reserved, limit, size)
 	}
 	e.stageReserved += size

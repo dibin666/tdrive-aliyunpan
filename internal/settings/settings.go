@@ -216,13 +216,13 @@ func (s *Settings) Normalize() error {
 	}
 	s.StageDir = strings.TrimSpace(s.StageDir)
 	if s.StageDir != "" && !filepath.IsAbs(s.StageDir) {
-		return errors.New("stageDir 必须是绝对路径")
+		return errors.New("暂存目录 stageDir 必须使用绝对路径")
 	}
 	if err := checkPathText("stageDir", s.StageDir); err != nil {
 		return err
 	}
 	if s.StageLimitBytes < 0 {
-		return errors.New("stageLimitBytes 不能为负数")
+		return errors.New("stageLimitBytes 不能为负数，请填写 0 或正整数")
 	}
 	s.OwnerUserID = strings.TrimSpace(s.OwnerUserID)
 	s.DownloadRate = strings.TrimSpace(s.DownloadRate)
@@ -230,7 +230,7 @@ func (s *Settings) Normalize() error {
 		s.DownloadConcurrency = DefaultDownloadConcurrency
 	}
 	if s.DownloadConcurrency < 1 || s.DownloadConcurrency > maxDownloadConcurrency {
-		return fmt.Errorf("阿里云盘同时下载数必须在 1~%d 之间", maxDownloadConcurrency)
+		return fmt.Errorf("阿里云盘同时下载数必须在 1~%d 之间，请调整数值", maxDownloadConcurrency)
 	}
 	if err := s.Retry.normalize(); err != nil {
 		return err
@@ -240,7 +240,7 @@ func (s *Settings) Normalize() error {
 		s.Schedule.IntervalMinutes = DefaultInterval
 	}
 	if s.Schedule.IntervalMinutes < minIntervalMinutes || s.Schedule.IntervalMinutes > maxIntervalMinutes {
-		return fmt.Errorf("扫描间隔必须在 %d~%d 分钟之间", minIntervalMinutes, maxIntervalMinutes)
+		return fmt.Errorf("扫描间隔必须在 %d~%d 分钟之间，请调整数值", minIntervalMinutes, maxIntervalMinutes)
 	}
 	if err := checkClock("窗口开始", s.Schedule.WindowStart); err != nil {
 		return err
@@ -255,7 +255,7 @@ func (s *Settings) Normalize() error {
 		return err
 	}
 	if s.Quota.DailyBytes < 0 {
-		return errors.New("每日配额不能为负数")
+		return errors.New("每日配额不能为负数，请填写 0 或正数")
 	}
 
 	if s.Jobs == nil {
@@ -268,7 +268,7 @@ func (s *Settings) Normalize() error {
 			return err
 		}
 		if seen[job.ID] {
-			return fmt.Errorf("任务 ID 重复: %s", job.ID)
+			return fmt.Errorf("任务 ID 重复: %s，请修改任务 ID", job.ID)
 		}
 		seen[job.ID] = true
 	}
@@ -290,16 +290,16 @@ func (r *Retry) normalize() error {
 		r.MaxSeconds = DefaultRetryMaxSeconds
 	}
 	if r.MaxAttempts < 1 || r.MaxAttempts > maxRetryAttempts {
-		return fmt.Errorf("失败重试次数必须在 1~%d 之间", maxRetryAttempts)
+		return fmt.Errorf("失败重试次数必须在 1~%d 之间，请调整数值", maxRetryAttempts)
 	}
 	if r.InitialSeconds < 1 || r.InitialSeconds > maxRetryBackoffSeconds {
-		return fmt.Errorf("首次重试间隔必须在 1~%d 秒之间", maxRetryBackoffSeconds)
+		return fmt.Errorf("首次重试间隔必须在 1~%d 秒之间，请调整数值", maxRetryBackoffSeconds)
 	}
 	if r.MaxSeconds < 1 || r.MaxSeconds > maxRetryBackoffSeconds {
-		return fmt.Errorf("最大重试间隔必须在 1~%d 秒之间", maxRetryBackoffSeconds)
+		return fmt.Errorf("最大重试间隔必须在 1~%d 秒之间，请调整数值", maxRetryBackoffSeconds)
 	}
 	if r.MaxSeconds < r.InitialSeconds {
-		return errors.New("最大重试间隔不能小于首次重试间隔")
+		return errors.New("最大重试间隔不能小于首次重试间隔，请调大最大间隔或调小首次间隔")
 	}
 	return nil
 }
@@ -307,7 +307,7 @@ func (r *Retry) normalize() error {
 func (j *Job) normalize() error {
 	j.ID = strings.TrimSpace(j.ID)
 	if !idPattern.MatchString(j.ID) {
-		return fmt.Errorf("任务 ID 不合法: %q", j.ID)
+		return fmt.Errorf("任务 ID %q 不合法，仅支持字母、数字、下划线和短横线", j.ID)
 	}
 	j.Name = strings.TrimSpace(j.Name)
 	if j.Name == "" {
@@ -323,19 +323,19 @@ func (j *Job) normalize() error {
 		case "resource", "资源盘", "资源库":
 			j.DriveName = "resource"
 		default:
-			return fmt.Errorf("任务 %s 的网盘不支持 %q，只能是 backup（备份盘）或 resource（资源库）", j.Name, j.DriveName)
+			return fmt.Errorf("任务 %s 的网盘 %q 不支持，请选择 backup（备份盘）或 resource（资源库）", j.Name, j.DriveName)
 		}
 	}
 	j.RemotePath = CleanCloudPath(j.RemotePath)
 	if j.RemotePath == "" {
-		return fmt.Errorf("任务 %s 缺少云盘路径", j.Name)
+		return fmt.Errorf("任务 %s 缺少云盘路径，请指定要同步的云盘目录", j.Name)
 	}
 	if err := checkPathText("云盘路径", j.RemotePath); err != nil {
 		return fmt.Errorf("任务 %s: %w", j.Name, err)
 	}
 	j.TargetPath = CleanCloudPath(j.TargetPath)
 	if j.TargetPath == "" {
-		return fmt.Errorf("任务 %s 缺少 tdrive 目标路径", j.Name)
+		return fmt.Errorf("任务 %s 缺少 tdrive 目标路径，请指定落点目录", j.Name)
 	}
 	if err := checkPathText("tdrive 目标路径", j.TargetPath); err != nil {
 		return fmt.Errorf("任务 %s: %w", j.Name, err)
@@ -352,10 +352,10 @@ func (j *Job) normalize() error {
 	j.IncludeDirs = dirs
 
 	if j.MinSizeBytes < 0 || j.MaxSizeBytes < 0 {
-		return fmt.Errorf("任务 %s 的大小过滤不能为负数", j.Name)
+		return fmt.Errorf("任务 %s 的大小过滤不能为负数，请填写 0 或正数", j.Name)
 	}
 	if j.MaxSizeBytes > 0 && j.MinSizeBytes > j.MaxSizeBytes {
-		return fmt.Errorf("任务 %s 的最小值大于最大值", j.Name)
+		return fmt.Errorf("任务 %s 的大小最小值大于最大值，请调整过滤区间", j.Name)
 	}
 	patterns := make([]string, 0, len(j.ExcludeNames))
 	for _, pattern := range j.ExcludeNames {
@@ -364,10 +364,10 @@ func (j *Job) normalize() error {
 			continue
 		}
 		if len(pattern) > maxExcludePatternLen {
-			return fmt.Errorf("任务 %s 的排除规则过长", j.Name)
+			return fmt.Errorf("任务 %s 的排除规则过长，请缩短正则表达式", j.Name)
 		}
 		if _, err := regexp.Compile(pattern); err != nil {
-			return fmt.Errorf("任务 %s 的排除规则 %q 不是合法的正则: %w", j.Name, pattern, err)
+			return fmt.Errorf("任务 %s 的排除规则 %q 不是合法正则: %w，请检查正则语法", j.Name, pattern, err)
 		}
 		patterns = append(patterns, pattern)
 	}
@@ -393,7 +393,7 @@ func (j *Job) normalizeSelection(label string, paths []string) ([]string, error)
 			return nil, fmt.Errorf("任务 %s: %w", j.Name, err)
 		}
 		if j.RemotePath != "/" && !strings.HasPrefix(cleaned, j.RemotePath+"/") {
-			return nil, fmt.Errorf("任务 %s %s %s 不在云盘目录 %s 里", j.Name, label, cleaned, j.RemotePath)
+			return nil, fmt.Errorf("任务 %s 的%s %s 不在云盘目录 %s 下，请重新选择", j.Name, label, cleaned, j.RemotePath)
 		}
 		if seen[cleaned] {
 			continue
@@ -437,7 +437,7 @@ func CleanCloudPath(path string) string {
 
 func checkPathText(label, value string) error {
 	if strings.ContainsAny(value, "\x00\r\n") {
-		return fmt.Errorf("%s 不能含有 NUL 或换行字符", label)
+		return fmt.Errorf("%s 不能包含 NUL 或换行符，请移除特殊字符", label)
 	}
 	return nil
 }
@@ -447,7 +447,7 @@ func checkClock(label, value string) error {
 		return nil
 	}
 	if !clockPattern.MatchString(value) {
-		return fmt.Errorf("%s 必须形如 HH:MM，收到 %q", label, value)
+		return fmt.Errorf("%s 格式错误: %q，请使用 HH:MM 格式", label, value)
 	}
 	return nil
 }

@@ -74,7 +74,7 @@ func NormalizeDriveName(value string) (string, error) {
 	case DriveResource, "资源盘", "资源库":
 		return DriveResource, nil
 	default:
-		return "", fmt.Errorf("不支持的网盘 %q，只能是 backup（备份盘）或 resource（资源库）", value)
+		return "", fmt.Errorf("网盘 %q 不支持，仅支持 backup（备份盘）或 resource（资源库）", value)
 	}
 }
 
@@ -88,7 +88,7 @@ func resolveDrive(kind string, drives []Drive) (Drive, error) {
 	if kind == DriveResource {
 		label = "资源库"
 	}
-	return Drive{}, fmt.Errorf("当前阿里云盘账号没有%s", label)
+	return Drive{}, fmt.Errorf("当前阿里云盘账号缺少%s，请检查网盘权限", label)
 }
 
 // convertFileEntity maps the upstream aliyunpan-api model into the plugin's
