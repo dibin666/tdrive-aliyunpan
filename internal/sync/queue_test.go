@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/dibin/tdrive-aliyunpan/internal/hostapi"
 )
@@ -11,6 +12,7 @@ func newQueueEngine(items ...*Item) *Engine {
 	return &Engine{
 		host:       hostapi.New(&zeroSegmentHost{}),
 		queue:      items,
+		runs:       make(map[string]*transferRun),
 		cancels:    make(map[string]context.CancelFunc),
 		cancelling: make(map[string]bool),
 		deleting:   make(map[string]int),
@@ -25,22 +27,24 @@ func TestCancelInterruptsARunningTransfer(t *testing.T) {
 	engine := newQueueEngine(item)
 
 	ctx, release := engine.watchItem(context.Background(), item.ID)
-	defer release()
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- engine.Cancel(context.Background(), item.ID) }()
 
-	if err := engine.Cancel(context.Background(), item.ID); err != nil {
-		t.Fatalf("Cancel: %v", err)
-	}
-	if item.State != StateCancelled {
-		t.Errorf("State = %q, want %q", item.State, StateCancelled)
-	}
 	select {
 	case <-ctx.Done():
-	default:
-		t.Error("cancelling left the running transfer's context alive")
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not reach the running transfer")
 	}
 	// The transfer goroutine asks this before deciding what its error meant.
 	if !engine.stoppedByCancel(item.ID) {
 		t.Error("the transfer was not told it stopped on purpose")
+	}
+	release()
+	if err := <-cancelDone; err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if item.State != StateCancelled {
+		t.Errorf("State = %q, want %q", item.State, StateCancelled)
 	}
 }
 
@@ -51,14 +55,20 @@ func TestCancelledItemIsNotRequeued(t *testing.T) {
 	item := &Item{ID: "a", State: StateRunning}
 	engine := newQueueEngine(item)
 
-	_, release := engine.watchItem(context.Background(), item.ID)
-	defer release()
-	if err := engine.Cancel(context.Background(), item.ID); err != nil {
-		t.Fatalf("Cancel: %v", err)
+	ctx, release := engine.watchItem(context.Background(), item.ID)
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- engine.Cancel(context.Background(), item.ID) }()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not reach the running transfer")
 	}
-
 	if !engine.stoppedByCancel(item.ID) {
 		t.Fatal("stoppedByCancel did not report the cancellation")
+	}
+	release()
+	if err := <-cancelDone; err != nil {
+		t.Fatalf("Cancel: %v", err)
 	}
 	if item.State != StateCancelled {
 		t.Fatalf("State = %q, want %q", item.State, StateCancelled)

@@ -38,6 +38,15 @@ const (
 	historyLimit = 500
 )
 
+type transferRun struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	doneOnce        sync.Once
+	cancelRequested bool
+	started         bool
+}
+
 // Engine runs the queue.
 type Engine struct {
 	host   *hostapi.Client
@@ -77,12 +86,15 @@ type Engine struct {
 	quotaDirty    bool
 	persistMu     sync.Mutex
 
-	// cancels holds the context of every transfer currently moving bytes, so a
-	// cancellation from the queue view can interrupt one instead of waiting for
-	// it. cancelling remembers which of those stopped on purpose: the error a
-	// cancelled transfer reports is a context error like any other, and without
-	// this the deferred-retry path would read it as a blip and queue the file
-	// straight back up. Both are guarded by mu.
+	// runs is the lifecycle record for every claimed transfer. It is installed
+	// while takeNext claims the item, before dispatch starts the goroutine, so a
+	// cancellation cannot fall into the gap before watchItem runs. done closes
+	// only after the transfer's deferred cleanup has completed. Both runs and
+	// the compatibility maps below are guarded by mu.
+	runs map[string]*transferRun
+	// cancels and cancelling are kept as the transfer's cancellation view for
+	// older helpers and the state/error paths. They mirror the active run and
+	// are removed together with it; neither is used as a permanent retry lock.
 	cancels    map[string]context.CancelFunc
 	cancelling map[string]bool
 	// deleting tracks in-flight staged file deletions (by refcount) across
@@ -116,6 +128,7 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 		logger:      logger,
 		settings:    settings.Default(),
 		queue:       []*Item{},
+		runs:        make(map[string]*transferRun),
 		cancels:     make(map[string]context.CancelFunc),
 		cancelling:  make(map[string]bool),
 		deleting:    make(map[string]int),
@@ -127,6 +140,39 @@ func New(host *hostapi.Client, dataDir string, logger *log.Logger) *Engine {
 
 func (e *Engine) isDeletingLocked(id string) bool {
 	return e.deleting != nil && e.deleting[id] > 0
+}
+
+func (e *Engine) activeRunLocked(id string) *transferRun {
+	if e.runs == nil {
+		return nil
+	}
+	return e.runs[id]
+}
+
+func (e *Engine) cancellationRequestedLocked(id string) bool {
+	if run := e.activeRunLocked(id); run != nil && run.cancelRequested {
+		return true
+	}
+	return e.cancelling != nil && e.cancelling[id]
+}
+
+// registerRunLocked creates the cancellation context before the scheduler
+// starts the worker goroutine. The caller must hold mu.
+func (e *Engine) registerRunLocked(ctx context.Context, id string) *transferRun {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e.runs == nil {
+		e.runs = make(map[string]*transferRun)
+	}
+	if e.cancels == nil {
+		e.cancels = make(map[string]context.CancelFunc)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	run := &transferRun{ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+	e.runs[id] = run
+	e.cancels[id] = cancel
+	return run
 }
 
 func (e *Engine) markDeletingLocked(id string) {
@@ -694,7 +740,7 @@ func (e *Engine) dispatch(ctx context.Context) {
 	}
 
 	for {
-		item := e.takeNext(workers)
+		item := e.takeNextForDispatch(ctx, workers)
 		if item == nil {
 			return
 		}
@@ -711,7 +757,24 @@ func (e *Engine) dispatch(ctx context.Context) {
 }
 
 // takeNext claims the next item that fits in the remaining quota, or nil.
+// Tests and non-dispatch callers use this form when they will register their
+// own worker through watchItem.
 func (e *Engine) takeNext(workers int) *Item {
+	return e.takeNextWithRun(nil, workers)
+}
+
+// takeNextForDispatch claims an item and records its run before returning. The
+// scheduler must use this form: Cancel can otherwise observe StateRunning
+// between takeNext and the goroutine's call to watchItem, with nobody left to
+// clear the cancellation marker or tell Retry that the old worker is gone.
+func (e *Engine) takeNextForDispatch(ctx context.Context, workers int) *Item {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return e.takeNextWithRun(ctx, workers)
+}
+
+func (e *Engine) takeNextWithRun(ctx context.Context, workers int) *Item {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.paused || e.active >= workers {
@@ -730,7 +793,7 @@ func (e *Engine) takeNext(workers int) *Item {
 		if item.NextAttemptAt > now {
 			continue
 		}
-		if e.cancels[item.ID] != nil || e.cancelling[item.ID] || e.isDeletingLocked(item.ID) {
+		if e.activeRunLocked(item.ID) != nil || e.isDeletingLocked(item.ID) {
 			continue
 		}
 		job, ok := e.settings.JobByID(item.JobID)
@@ -752,6 +815,9 @@ func (e *Engine) takeNext(workers int) *Item {
 		item.resetSpeed()
 		e.active++
 		e.reserved += item.Size
+		if ctx != nil {
+			e.registerRunLocked(ctx, item.ID)
+		}
 		e.markQueueDirtyLocked()
 		return item
 	}
@@ -938,7 +1004,7 @@ func (e *Engine) noteDownload(item *Item, done int64) {
 
 func (e *Engine) complete(ctx context.Context, item *Item) bool {
 	e.mu.Lock()
-	if e.cancelling[item.ID] || item.State == StateCancelled {
+	if e.cancellationRequestedLocked(item.ID) || item.State == StateCancelled {
 		e.mu.Unlock()
 		return false
 	}
@@ -1008,7 +1074,7 @@ func (e *Engine) complete(ctx context.Context, item *Item) bool {
 func (e *Engine) fail(ctx context.Context, item *Item, err error) {
 	e.logf("同步 %s 失败: %v", item.RemotePath, err)
 	e.mu.Lock()
-	if e.cancelling[item.ID] || item.State == StateCancelled {
+	if e.cancellationRequestedLocked(item.ID) || item.State == StateCancelled {
 		e.mu.Unlock()
 		return
 	}
@@ -1035,7 +1101,7 @@ func (e *Engine) fail(ctx context.Context, item *Item, err error) {
 func (e *Engine) trimHistoryLocked() []*Item {
 	finished := make([]*Item, 0, len(e.queue))
 	for _, item := range e.queue {
-		if item.Finished() && !item.DeleteAfter && e.cancels[item.ID] == nil && !e.cancelling[item.ID] && !e.isDeletingLocked(item.ID) {
+		if item.Finished() && !item.DeleteAfter && e.activeRunLocked(item.ID) == nil && !e.isDeletingLocked(item.ID) {
 			finished = append(finished, item)
 		}
 	}
@@ -1131,6 +1197,13 @@ func cloneQueue(queue []*Item) []*Item {
 	return cloned
 }
 
+func detachedContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
 func persistContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1181,8 +1254,15 @@ func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 		wanted[id] = true
 	}
 
+	type staleUpload struct {
+		item  *Item
+		jobID string
+		state string
+	}
+
 	e.mu.Lock()
 	matched, requeued := 0, 0
+	var stale []staleUpload
 	for _, item := range e.queue {
 		if !wanted[item.ID] {
 			continue
@@ -1190,21 +1270,28 @@ func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 		matched++
 		// A running item is already doing what a retry would ask for. A
 		// complete item has already moved its file and must not be retried
-		// into an upload loop that recharges the daily quota. An item with an
-		// active transfer or staged-file deletion in flight is also skipped.
+		// into an upload loop that recharges the daily quota. The run record,
+		// rather than the persisted state or a cancellation flag, is the source
+		// of truth for an active worker. An item being cleaned up is skipped too:
+		// starting its replacement before the old upload is gone would create
+		// two writers for one queue row.
 		if item.State == StateRunning || item.State == StateComplete ||
-			e.cancels[item.ID] != nil || e.cancelling[item.ID] || e.isDeletingLocked(item.ID) {
+			e.activeRunLocked(item.ID) != nil || e.isDeletingLocked(item.ID) {
 			continue
 		}
-		item.State = StatePending
-		item.Stage = StageIdle
-		item.Error = ""
-		item.Downloaded = 0
-		item.Uploaded = 0
-		item.UploadJobID = ""
-		item.FinishedAt = 0
-		item.Attempts = 0
-		item.NextAttemptAt = 0
+		if item.UploadJobID != "" {
+			// A job left in persisted state can still own segments in tdrive.
+			// Reserve the row while it is aborted; only then may this retry
+			// clear the ID and become pending.
+			e.markDeletingLocked(item.ID)
+			state := "failed"
+			if item.State == StateCancelled {
+				state = "cancelled"
+			}
+			stale = append(stale, staleUpload{item: item, jobID: item.UploadJobID, state: state})
+			continue
+		}
+		e.resetForRetryLocked(item)
 		requeued++
 	}
 	if requeued > 0 {
@@ -1215,12 +1302,65 @@ func (e *Engine) Retry(ctx context.Context, ids ...string) error {
 	if matched == 0 {
 		return errors.New("队列中未找到指定项目，可能已被清理")
 	}
+
+	// A queue action is allowed to finish its durable cleanup even if the HTTP
+	// request that triggered it has already been cancelled.
+	cleanupCtx := detachedContext(ctx)
+	var cleanupErr error
+	for _, target := range stale {
+		err := e.abort(cleanupCtx, target.item, target.jobID, "retry", target.state)
+		e.mu.Lock()
+		if err != nil {
+			// Keep the ID visible so a later retry can make another cleanup
+			// attempt instead of starting a new writer beside an unknown job.
+			if target.item.UploadJobID == "" {
+				target.item.UploadJobID = target.jobID
+				e.markQueueDirtyLocked()
+			}
+			if cleanupErr == nil {
+				cleanupErr = err
+			}
+		} else if e.activeRunLocked(target.item.ID) == nil {
+			delete(e.cancels, target.item.ID)
+			delete(e.cancelling, target.item.ID)
+			e.resetForRetryLocked(target.item)
+			requeued++
+			e.markQueueDirtyLocked()
+		}
+		e.unmarkDeletingLocked(target.item.ID)
+		e.mu.Unlock()
+	}
+
 	if requeued == 0 {
+		if cleanupErr != nil {
+			e.persistNow(cleanupCtx)
+			return fmt.Errorf("重试前清理旧上传失败: %w", cleanupErr)
+		}
 		return errors.New("选中的项目正在传输或已完成，无需重试")
 	}
-	e.persistNow(ctx)
+	if cleanupErr != nil {
+		// Preserve the successful part of a multi-select action, but tell the
+		// caller that one old host job could not be made safe for retry.
+		e.persistNow(cleanupCtx)
+		return fmt.Errorf("重试前清理旧上传失败: %w", cleanupErr)
+	}
+	e.persistNow(cleanupCtx)
 	e.Wake()
 	return nil
+}
+
+func (e *Engine) resetForRetryLocked(item *Item) {
+	delete(e.cancels, item.ID)
+	delete(e.cancelling, item.ID)
+	item.State = StatePending
+	item.Stage = StageIdle
+	item.Error = ""
+	item.Downloaded = 0
+	item.Uploaded = 0
+	item.UploadJobID = ""
+	item.FinishedAt = 0
+	item.Attempts = 0
+	item.NextAttemptAt = 0
 }
 
 // Cancel stops the named items.
@@ -1242,12 +1382,18 @@ func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
 	}
 
 	type stopping struct {
-		item   *Item
-		jobID  string
-		cancel context.CancelFunc
+		item *Item
+		run  *transferRun
+	}
+	type cleanup struct {
+		item  *Item
+		jobID string
 	}
 
 	e.mu.Lock()
+	if e.runs == nil {
+		e.runs = make(map[string]*transferRun)
+	}
 	if e.cancels == nil {
 		e.cancels = make(map[string]context.CancelFunc)
 	}
@@ -1259,24 +1405,41 @@ func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
 	}
 	matched, cancelled := 0, 0
 	var interrupted []stopping
-	var nonRunning []*Item
+	var nonRunning []cleanup
 	for _, item := range e.queue {
-		if !wanted[item.ID] || item.State == StateComplete || item.State == StateCancelled {
-			if wanted[item.ID] {
-				matched++
-			}
+		if !wanted[item.ID] {
 			continue
 		}
 		matched++
+		if item.State == StateComplete {
+			continue
+		}
+		// Retry or DeleteStaged may be finishing an old job outside the
+		// mutex. Leave that operation to its owner instead of changing the
+		// row back underneath it.
+		if e.activeRunLocked(item.ID) == nil && e.isDeletingLocked(item.ID) {
+			continue
+		}
+
 		cancelled++
-		if item.State == StateRunning || e.cancels[item.ID] != nil || e.cancelling[item.ID] {
+		run := e.activeRunLocked(item.ID)
+		if run != nil {
+			// The run record covers both a worker already inside transfer and
+			// one whose goroutine has not reached watchItem yet. In either case
+			// the same done channel tells us when it is safe to clean the old
+			// upload and let Retry proceed.
+			run.cancelRequested = true
 			e.cancelling[item.ID] = true
-			interrupted = append(interrupted, stopping{
-				item: item, jobID: item.UploadJobID, cancel: e.cancels[item.ID],
-			})
-		} else {
-			nonRunning = append(nonRunning, item)
 			e.markDeletingLocked(item.ID)
+			interrupted = append(interrupted, stopping{item: item, run: run})
+		} else {
+			// StateRunning is persisted state, not proof of a live goroutine. A
+			// crash or the takeNext/watchItem window can leave it behind. Do
+			// not create a cancellation marker that nobody can clear.
+			delete(e.cancels, item.ID)
+			delete(e.cancelling, item.ID)
+			e.markDeletingLocked(item.ID)
+			nonRunning = append(nonRunning, cleanup{item: item, jobID: item.UploadJobID})
 		}
 		item.State = StateCancelled
 		item.Stage = StageIdle
@@ -1292,32 +1455,49 @@ func (e *Engine) Cancel(ctx context.Context, ids ...string) error {
 	if matched == 0 {
 		return errors.New("队列中未找到指定项目，可能已被清理")
 	}
+	// Cancelling an already-cancelled row is deliberately idempotent. A
+	// completed row is the only terminal state that cannot be cancelled.
 	if cancelled == 0 {
 		return errors.New("选中的项目已全部完成或已取消")
 	}
 
+	cleanupCtx := detachedContext(ctx)
+
 	// Non-running items have no active transfer goroutine to discard their
-	// partial work on exit, so they are discarded here explicitly.
-	e.discardStagedWorkFor(nonRunning)
-	if len(nonRunning) > 0 {
-		e.mu.Lock()
-		for _, item := range nonRunning {
-			e.unmarkDeletingLocked(item.ID)
+	// partial work on exit. Their old upload job, if any, is cleaned here too.
+	for _, target := range nonRunning {
+		e.discardStagedWork(target.item)
+		if target.jobID != "" {
+			e.abort(cleanupCtx, target.item, target.jobID, "cancelled", "cancelled")
 		}
+		e.mu.Lock()
+		e.unmarkDeletingLocked(target.item.ID)
 		e.mu.Unlock()
 	}
 
 	for _, stopped := range interrupted {
-		if stopped.cancel != nil {
-			stopped.cancel()
+		if stopped.run.cancel != nil {
+			stopped.run.cancel()
 		}
-		// Aborting the drive's job is what stops tdrive from showing a transfer
-		// that is still running behind a queue entry that says cancelled.
-		if stopped.jobID != "" {
-			e.abort(ctx, stopped.item, stopped.jobID, "cancelled", "cancelled")
+		// Wait until the transfer has unwound all of its deferred work. In
+		// particular, upload's own abort (when it owns the job) must finish
+		// before this action exposes a successful retry.
+		<-stopped.run.done
+
+		e.mu.Lock()
+		jobID := stopped.item.UploadJobID
+		e.mu.Unlock()
+		if jobID != "" {
+			e.abort(cleanupCtx, stopped.item, jobID, "cancelled", "cancelled")
 		}
+		e.mu.Lock()
+		e.unmarkDeletingLocked(stopped.item.ID)
+		e.mu.Unlock()
 	}
-	e.persistNow(ctx)
+
+	// The request context may belong to a short-lived HTTP handler. The state
+	// and cleanup must still be durable after that handler disconnects.
+	e.persistNow(cleanupCtx)
 	return nil
 }
 
@@ -1344,7 +1524,7 @@ func (e *Engine) ClearFinished(ctx context.Context, ids ...string) {
 		// Only finished rows with no active goroutine in flight are history.
 		// Dropping a running or still-aborting one would leave its goroutine
 		// writing to an item nothing can show any more.
-		if !item.Finished() || e.cancels[item.ID] != nil || e.cancelling[item.ID] || (wanted != nil && !wanted[item.ID]) {
+		if !item.Finished() || e.activeRunLocked(item.ID) != nil || e.isDeletingLocked(item.ID) || (wanted != nil && !wanted[item.ID]) {
 			kept = append(kept, item)
 			continue
 		}
@@ -1358,30 +1538,53 @@ func (e *Engine) ClearFinished(ctx context.Context, ids ...string) {
 }
 
 // watchItem derives the context one transfer runs on and registers it so Cancel
-// can interrupt it.
+// can interrupt it. A dispatch-created run is already present when this is
+// called; creating the run here is the fallback for tests and direct callers.
 func (e *Engine) watchItem(ctx context.Context, id string) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.mu.Lock()
+	if e.runs == nil {
+		e.runs = make(map[string]*transferRun)
+	}
 	if e.cancels == nil {
 		e.cancels = make(map[string]context.CancelFunc)
 	}
 	if e.cancelling == nil {
 		e.cancelling = make(map[string]bool)
 	}
-	if e.cancelling[id] {
-		// Cancel arrived in the gap between takeNext and watchItem. Cancel
-		// the context immediately so the transfer aborts before starting any
-		// network work.
-		cancel()
+	run := e.activeRunLocked(id)
+	if run == nil {
+		run = e.registerRunLocked(ctx, id)
 	}
-	e.cancels[id] = cancel
+	run.started = true
+	cancelRequested := run.cancelRequested || e.cancelling[id]
+	if cancelRequested {
+		// Cancel arrived before the worker reached this point. Cancel the
+		// already-registered context so it cannot start network work.
+		run.cancelRequested = true
+		e.cancelling[id] = true
+	}
+	e.cancels[id] = run.cancel
+	runCtx := run.ctx
 	e.mu.Unlock()
-	return ctx, func() {
-		cancel()
-		e.mu.Lock()
-		delete(e.cancels, id)
-		delete(e.cancelling, id)
-		e.mu.Unlock()
+	if cancelRequested {
+		run.cancel()
+	}
+
+	return runCtx, func() {
+		run.doneOnce.Do(func() {
+			run.cancel()
+			e.mu.Lock()
+			if e.activeRunLocked(id) == run {
+				delete(e.runs, id)
+				delete(e.cancels, id)
+				delete(e.cancelling, id)
+			}
+			close(run.done)
+			e.mu.Unlock()
+		})
 	}
 }
 
@@ -1391,7 +1594,7 @@ func (e *Engine) watchItem(ctx context.Context, id string) (context.Context, fun
 func (e *Engine) stoppedByCancel(id string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.cancelling[id]
+	return e.cancellationRequestedLocked(id)
 }
 
 // stagedBytesExcluding measures the staging tree while ignoring the private

@@ -296,7 +296,7 @@ func jitter(wait time.Duration) time.Duration {
 // upload job is abandoned rather than resumed.
 func (e *Engine) requeue(ctx context.Context, item *Item, reason string, notBefore int64, chargeAttempt bool) {
 	e.mu.Lock()
-	if e.cancelling[item.ID] || item.State == StateCancelled {
+	if e.cancellationRequestedLocked(item.ID) || item.State == StateCancelled {
 		e.mu.Unlock()
 		return
 	}
@@ -474,6 +474,14 @@ func (e *Engine) upload(ctx context.Context, item *Item, staged string, limits h
 		}
 		missing, err := e.commit(ctx, job.ID)
 		if err == nil {
+			// The host job is terminal now. Do not leave its ID on the queue:
+			// a cancellation racing this return must not try to abort a
+			// completed upload, and the next retry must always create a new job.
+			e.mu.Lock()
+			if item.UploadJobID == job.ID {
+				item.UploadJobID = ""
+			}
+			e.mu.Unlock()
 			return nil
 		}
 		lastErr = err
@@ -618,17 +626,36 @@ func parseMissingSegments(err error) []int {
 // state is what tdrive records: "failed" for a transfer that broke, "cancelled"
 // for one somebody stopped. Recording every abort as a failure made a
 // cancellation from this page show up in tdrive's history as an error.
-func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason, state string) {
+func (e *Engine) abort(ctx context.Context, item *Item, jobID, reason, state string) error {
+	if jobID == "" {
+		return nil
+	}
+	// Claim the queue's current job ID before making the host call. A transfer
+	// that reports its own cancellation and Cancel racing to clean the same job
+	// then has one owner: the loser sees that the ID has already been cleared.
+	e.mu.Lock()
+	if item != nil && item.UploadJobID != jobID {
+		e.mu.Unlock()
+		return nil
+	}
+	if item != nil {
+		item.UploadJobID = ""
+	}
+	e.mu.Unlock()
+
 	// The cleanup context outlives the cancellation that usually causes it,
 	// which is the whole reason a cancelled upload can still be tidied up.
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
-	if err := e.host.AbortUpload(cleanupCtx, jobID, reason, state); err != nil {
-		e.logf("放弃上传 %s 失败: %v", item.Name, err)
+	err := e.host.AbortUpload(cleanupCtx, jobID, reason, state)
+	if err != nil {
+		if item != nil {
+			e.logf("放弃上传 %s 失败: %v", item.Name, err)
+		} else {
+			e.logf("放弃上传 %s 失败: %v", jobID, err)
+		}
 	}
-	e.mu.Lock()
-	item.UploadJobID = ""
-	e.mu.Unlock()
+	return err
 }
 
 func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {

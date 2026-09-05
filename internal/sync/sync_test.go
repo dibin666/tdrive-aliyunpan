@@ -1062,6 +1062,7 @@ func retryingEngine(t *testing.T, attempts int) *Engine {
 	return &Engine{
 		host:       hostapi.New(&zeroSegmentHost{}),
 		dataDir:    t.TempDir(),
+		runs:       map[string]*transferRun{},
 		cancels:    map[string]context.CancelFunc{},
 		cancelling: map[string]bool{},
 		settings: settings.Settings{

@@ -106,7 +106,7 @@ func (e *Engine) Downloads(ctx context.Context) DownloadsView {
 			file.Size = item.Size
 			file.Error = item.Error
 			file.Attempts = item.Attempts
-			file.Running = item.State == StateRunning
+			file.Running = e.activeRunLocked(item.ID) != nil
 			remotePath := item.RemotePath
 			size := item.Size
 			e.mu.Unlock()
@@ -185,7 +185,7 @@ func (e *Engine) DeleteStaged(ctx context.Context, ids ...string) (int, error) {
 			continue
 		}
 		known[item.ID] = true
-		if item.State == StateRunning || e.cancels[item.ID] != nil || e.cancelling[item.ID] || e.isDeletingLocked(item.ID) {
+		if item.State == StateRunning || e.activeRunLocked(item.ID) != nil || e.isDeletingLocked(item.ID) {
 			running++
 			continue
 		}
